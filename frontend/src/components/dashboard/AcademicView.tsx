@@ -2,7 +2,7 @@ import React from "react";
 import { BookOpen, Clock, Users, ArrowRight } from "lucide-react";
 import { motion } from "framer-motion";
 import { useNavigate } from "react-router-dom";
-import type { DashboardCourse } from "../../lib/supabase";
+
 
 interface AcademicViewProps {
   courses: DashboardCourse[];

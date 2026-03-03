@@ -73,5 +73,3 @@ export default function BootcampView({ courses }: BootcampViewProps) {
   );
 }
 
-
-
