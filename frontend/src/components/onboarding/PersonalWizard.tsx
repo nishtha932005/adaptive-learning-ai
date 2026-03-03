@@ -1,33 +1,44 @@
 import React, { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useAuth } from "../../context/AuthContext";
-import { supabase } from "../../lib/supabase";
 import { useTheme } from "../../context/ThemeContext";
-import { Loader2, Sparkles, Target, Zap, BookOpen, ArrowRight, ArrowLeft } from "lucide-react";
+import { Loader2, Sparkles, Target, Zap, ArrowRight, ArrowLeft, Mail } from "lucide-react";
 
-type Step = 1 | 2 | 3;
+type Step = 1 | 2 | 3 | 4;
 
 interface PersonalWizardProps {
   onComplete: () => void;
+  initialStep?: Step;
+  initialEmail?: string;
+  initialMessage?: string | null;
 }
 
-export default function PersonalWizard({ onComplete }: PersonalWizardProps) {
-  const { user, signUp } = useAuth();
+export default function PersonalWizard({
+  onComplete,
+  initialStep = 1,
+  initialEmail = "",
+  initialMessage = null,
+}: PersonalWizardProps) {
+  const { user, signUp, confirmSignUp, resendSignUpCode } = useAuth();
   const { themeColor } = useTheme();
-  const [step, setStep] = useState<Step>(1);
+  const [step, setStep] = useState<Step>(initialStep);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(initialMessage);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [isVerified, setIsVerified] = useState(false);
 
   // Form state
-  const [email, setEmail] = useState("");
+  const [email, setEmail] = useState(initialEmail);
   const [password, setPassword] = useState("");
   const [fullName, setFullName] = useState("");
   const [goal, setGoal] = useState("");
   const [vibe, setVibe] = useState<"saga" | "bootcamp" | "academic" | null>(null);
   const [pace, setPace] = useState<"blitz" | "moderate" | "deep" | null>(null);
+  const [verificationCode, setVerificationCode] = useState("");
 
-  const next = () => {
+  const next = async () => {
     setError(null);
+    setSuccessMessage(null);
 
     // Step 1 validation
     if (step === 1) {
@@ -50,6 +61,33 @@ export default function PersonalWizard({ onComplete }: PersonalWizardProps) {
           return;
         }
       }
+
+      if (!user) {
+        setLoading(true);
+        const { error: signUpError } = await signUp(email, password, fullName);
+
+        if (signUpError) {
+          const message = signUpError.message || "Failed to create account";
+
+          if (message.toLowerCase().includes("already exists")) {
+            const { error: resendError } = await resendSignUpCode(email);
+            if (!resendError) {
+              setSuccessMessage(
+                "Account exists but is not verified. Verification code sent to your email."
+              );
+              setLoading(false);
+              setStep(4);
+              return;
+            }
+          }
+
+          setError(message);
+          setLoading(false);
+          return;
+        }
+        setSuccessMessage("Account created. Complete your setup and verify your email.");
+        setLoading(false);
+      }
     }
 
     // Step 2 validation
@@ -64,11 +102,16 @@ export default function PersonalWizard({ onComplete }: PersonalWizardProps) {
       return;
     }
 
+    if (step === 4 && !isVerified) {
+      setError("Please verify your email before completing setup.");
+      return;
+    }
+
     // Move to next step or complete
-    if (step < 3) {
+    if (step < 4) {
       setStep((s) => (s + 1) as Step);
     } else {
-      handleComplete();
+      onComplete();
     }
   };
 
@@ -79,267 +122,53 @@ export default function PersonalWizard({ onComplete }: PersonalWizardProps) {
     }
   };
 
-  const handleComplete = async () => {
-    // Validate wizard steps
-    if (!goal || !goal.trim()) {
-      setError("Please tell us what you're building");
+  const handleVerifyCode = async () => {
+    const normalizedEmail = email.trim();
+    const normalizedCode = verificationCode.trim();
+
+    if (!normalizedEmail) {
+      setError("Please enter your email address");
       return;
     }
-    if (!vibe) {
-      setError("Please select your preferred learning style");
-      return;
-    }
-    if (!pace) {
-      setError("Please select your learning pace");
+    if (!normalizedCode) {
+      setError("Please enter the verification code");
       return;
     }
 
     setLoading(true);
     setError(null);
+    setSuccessMessage(null);
 
-    try {
-      // Step 1: Create account if not logged in
-      let userId = user?.id;
-      let needsEmailConfirmation = false;
-
-      if (!userId) {
-        // Validate required fields before signup (only if not logged in)
-        if (!email || !email.trim()) {
-          setError("Please enter your email address");
-          setLoading(false);
-          return;
-        }
-        if (!password || password.length < 6) {
-          setError("Please enter a password (minimum 6 characters)");
-          setLoading(false);
-          return;
-        }
-        if (!fullName || !fullName.trim()) {
-          setError("Please enter your full name");
-          setLoading(false);
-          return;
-        }
-
-        const { error: signUpError, data: signUpData } = await signUp(email, password, fullName);
-
-        if (signUpError) {
-          setError(signUpError.message || "Failed to create account");
-          setLoading(false);
-          return;
-        }
-
-        // Check if email confirmation is required
-        if (signUpData?.user && !signUpData.user.email_confirmed_at) {
-          needsEmailConfirmation = true;
-          userId = signUpData.user.id;
-        } else if (signUpData?.user) {
-          userId = signUpData.user.id;
-        }
-      }
-
-      if (!userId) {
-        setError("Failed to create account. Please try again.");
-        setLoading(false);
-        return;
-      }
-
-      // Ensure we have an active session before proceeding
-      let session = null;
-      if (!user) {
-        // Wait for session to be established after signup
-        for (let i = 0; i < 10; i++) {
-          const { data: { session: currentSession } } = await supabase.auth.getSession();
-          if (currentSession) {
-            session = currentSession;
-            break;
-          }
-          await new Promise(resolve => setTimeout(resolve, 500));
-        }
-
-        if (!session) {
-          // If no session but we have userId, try to get user
-          const { data: { user: authUser } } = await supabase.auth.getUser();
-          if (!authUser) {
-            setError("Please check your email to verify your account, then sign in.");
-            setLoading(false);
-            return;
-          }
-        }
-      } else {
-        // Get current session
-        const { data: { session: currentSession } } = await supabase.auth.getSession();
-        session = currentSession;
-      }
-
-      // Wait for student record to be created by trigger (check with retries)
-      let studentExists = false;
-      for (let i = 0; i < 15; i++) {
-        try {
-          // Ensure we have a valid session before querying
-          const { data: { session: currentSession } } = await supabase.auth.getSession();
-          if (!currentSession && !user) {
-            // No session yet, wait and retry
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            continue;
-          }
-
-          const { data: studentCheck, error: checkError } = await supabase
-            .from("students")
-            .select("id")
-            .eq("id", userId)
-            .maybeSingle();
-
-          if (studentCheck && !checkError) {
-            studentExists = true;
-            break;
-          }
-
-          // Handle various error codes
-          if (checkError) {
-            const errorMsg = checkError.message || checkError.code || "";
-            console.log(`Attempt ${i + 1}: ${errorMsg}`);
-
-            // If we get auth errors (401, 406), wait for session to establish
-            if (checkError.code === "PGRST301" ||
-              errorMsg.includes("401") ||
-              errorMsg.includes("406") ||
-              errorMsg.includes("row-level security") ||
-              errorMsg.includes("RLS")) {
-              await new Promise(resolve => setTimeout(resolve, 1500));
-              continue;
-            }
-          }
-        } catch (e: any) {
-          console.log(`Attempt ${i + 1} error:`, e?.message || e);
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-
-      // If student record doesn't exist after waiting, try to create it
-      // But only if we have a valid session
-      if (!studentExists && session) {
-        // Get user email and name from auth if not provided in form
-        const { data: { user: authUser } } = await supabase.auth.getUser();
-        const userEmail = email || authUser?.email || "";
-        const userName = fullName || authUser?.user_metadata?.full_name || authUser?.email?.split("@")[0] || "User";
-
-        const { error: createError, data: createdData } = await supabase
-          .from("students")
-          .insert({
-            id: userId,
-            email: userEmail,
-            full_name: userName,
-            account_type: "personal",
-            onboarding_completed: false,
-          })
-          .select()
-          .single();
-
-        if (createError) {
-          // Check if it's a duplicate key error (record was created by trigger)
-          if (createError.code === "23505" || createError.message?.includes("duplicate")) {
-            // Record exists now, continue
-            studentExists = true;
-          } else {
-            // If it's an RLS error, the trigger should have created it
-            // Try one more time to check
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            const { data: finalCheck } = await supabase
-              .from("students")
-              .select("id")
-              .eq("id", userId)
-              .maybeSingle();
-
-            if (!finalCheck) {
-              console.error("Student record creation failed:", createError);
-              // Don't throw - continue anyway, the trigger might create it later
-              // Or the user might need to verify email first
-              if (needsEmailConfirmation) {
-                setError("Account created! Please check your email to verify, then sign in to complete setup.");
-                setLoading(false);
-                return;
-              }
-            } else {
-              studentExists = true;
-            }
-          }
-        } else if (createdData) {
-          studentExists = true;
-        }
-      } else if (!studentExists && !session) {
-        // No session and no student record - user needs to verify email
-        setError("Please check your email to verify your account, then sign in to complete setup.");
-        setLoading(false);
-        return;
-      }
-
-      // Step 2: Save learning preferences (Skipped - now stored directly in students table)
-      // The learning_preferences table was deprecated in favor of storing preferences on the student record directly.
-
-
-      // Step 3: Update student account
-      const { error: updateError } = await supabase
-        .from("students")
-        .update({
-          account_type: "personal",
-          learning_goal: goal,
-          learning_vibe: vibe,
-          learning_pace: pace,
-          onboarding_completed: true,
-        })
-        .eq("id", userId);
-
-      if (updateError) {
-        console.error("Update error:", updateError);
-        // Don't throw - try to continue anyway
-        // The update might fail if columns don't exist yet, but preferences are saved
-      }
-
-      // Step 4: Generate personalized saga if vibe is "saga"
-      if (vibe === "saga") {
-        try {
-          const { generatePersonalizedSaga } = await import("../../services/personalizationService");
-          await generatePersonalizedSaga(userId);
-        } catch (sagaError: any) {
-          console.error("Failed to generate personalized saga:", sagaError);
-          // Don't block completion - saga can be generated later on dashboard
-        }
-      }
-
-      // If email confirmation is needed, show message and redirect to login
-      if (needsEmailConfirmation) {
-        setLoading(false);
-        setError(null);
-        alert("Account created! Please check your email to verify your account, then sign in.");
-        setTimeout(() => {
-          onComplete();
-        }, 100);
-        return;
-      }
-
-      // Check if user is signed in
-      const { data: { session: finalSession } } = await supabase.auth.getSession();
-
+    const { error: confirmError } = await confirmSignUp(normalizedEmail, normalizedCode);
+    if (confirmError) {
+      setError(confirmError.message || "Failed to verify code");
       setLoading(false);
-
-      if (finalSession?.user) {
-        // User is signed in, navigate to dashboard
-        setTimeout(() => {
-          window.location.href = "/dashboard";
-        }, 500);
-      } else {
-        // Not signed in, redirect to login with success message
-        setTimeout(() => {
-          onComplete();
-        }, 500);
-      }
-    } catch (e: any) {
-      console.error("Setup error:", e);
-      setError(e?.message || "Failed to complete setup. Please try again.");
-      setLoading(false);
+      return;
     }
+
+    setIsVerified(true);
+    setSuccessMessage("Account verified successfully.");
+    setLoading(false);
+  };
+
+  const handleResendCode = async () => {
+    const normalizedEmail = email.trim();
+    if (!normalizedEmail) {
+      setError("Please enter your email address");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    const { error: resendError } = await resendSignUpCode(normalizedEmail);
+    if (resendError) {
+      setError(resendError.message || "Failed to resend verification code");
+      setLoading(false);
+      return;
+    }
+
+    setSuccessMessage("Verification code sent. Check your email.");
+    setLoading(false);
   };
 
   return (
@@ -360,7 +189,7 @@ export default function PersonalWizard({ onComplete }: PersonalWizardProps) {
             Back
           </button>
           <div className="flex items-center gap-2">
-            {[1, 2, 3].map((s) => (
+            {[1, 2, 3, 4].map((s) => (
               <div
                 key={s}
                 className={`h-2 w-8 rounded-full transition-all ${step >= s ? "bg-primary" : "bg-slate-200 dark:bg-slate-700"
@@ -369,6 +198,12 @@ export default function PersonalWizard({ onComplete }: PersonalWizardProps) {
             ))}
           </div>
         </div>
+
+        {successMessage && (
+          <div className="mb-6 text-xs text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-lg px-4 py-2">
+            {successMessage}
+          </div>
+        )}
 
         {error && (
           <div className="mb-6 text-xs text-rose-600 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-lg px-4 py-2">
@@ -603,12 +438,84 @@ export default function PersonalWizard({ onComplete }: PersonalWizardProps) {
               </div>
             </motion.div>
           )}
+
+          {/* Step 4: Verify Email */}
+          {step === 4 && (
+            <motion.div
+              key="step4"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="space-y-6"
+            >
+              <div className="text-center mb-6">
+                <div className="h-16 w-16 rounded-full bg-primary/10 flex items-center justify-center mx-auto mb-4">
+                  <Mail className="w-8 h-8 text-primary" />
+                </div>
+                <h2 className="text-2xl font-bold text-slate-900 dark:text-white mb-2">
+                  Verify Your Email
+                </h2>
+                <p className="text-sm text-slate-600 dark:text-slate-400">
+                  Enter the verification code sent to your email before completing setup.
+                </p>
+              </div>
+
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-2">
+                    Email Address
+                  </label>
+                  <input
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    required
+                    placeholder="your@email.com"
+                    className="w-full px-4 py-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-2">
+                    Verification Code
+                  </label>
+                  <input
+                    type="text"
+                    value={verificationCode}
+                    onChange={(e) => setVerificationCode(e.target.value)}
+                    required
+                    placeholder="Enter verification code"
+                    className="w-full px-4 py-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                  />
+                </div>
+
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={handleVerifyCode}
+                    disabled={loading || isVerified}
+                    className="flex-1 px-6 py-2.5 rounded-lg bg-primary text-white font-semibold text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isVerified ? "Verified" : "Verify Code"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleResendCode}
+                    disabled={loading}
+                    className="flex-1 px-6 py-2.5 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 font-semibold text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    Resend Code
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          )}
         </AnimatePresence>
 
         {/* Navigation */}
         <div className="mt-8 flex items-center justify-between">
           <div className="text-xs text-slate-500">
-            Step {step} of 3
+            Step {step} of 4
           </div>
           <button
             onClick={next}
@@ -616,7 +523,8 @@ export default function PersonalWizard({ onComplete }: PersonalWizardProps) {
               loading ||
               (step === 1 && (!goal || !goal.trim() || (!user && (!email?.trim() || !password || password.length < 6 || !fullName?.trim())))) ||
               (step === 2 && !vibe) ||
-              (step === 3 && !pace)
+              (step === 3 && !pace) ||
+              (step === 4 && !isVerified)
             }
             className="px-6 py-2.5 rounded-lg bg-primary text-white font-semibold text-sm disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
           >
@@ -625,7 +533,7 @@ export default function PersonalWizard({ onComplete }: PersonalWizardProps) {
                 <Loader2 className="w-4 h-4 animate-spin" />
                 Setting up...
               </>
-            ) : step === 3 ? (
+            ) : step === 4 ? (
               <>
                 <span>Complete Setup</span>
                 <Sparkles className="w-4 h-4" />

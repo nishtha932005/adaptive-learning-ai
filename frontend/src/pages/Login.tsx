@@ -15,6 +15,7 @@ export default function Login() {
 
   useEffect(() => {
     const message = searchParams.get("message");
+
     if (message) {
       setSuccessMessage(message);
       // Clear message after 5 seconds
@@ -30,7 +31,16 @@ export default function Login() {
     const { error: signInError } = await signIn(email, password);
 
     if (signInError) {
-      setError(signInError.message || "Invalid login credentials");
+      const message = signInError.message || "Invalid login credentials";
+      if (message.toLowerCase().includes("verify your account")) {
+        navigate(
+          `/signup?verify=1&email=${encodeURIComponent(email)}&message=${encodeURIComponent(
+            "Please verify your account before signing in."
+          )}`
+        );
+        return;
+      }
+      setError(message);
       setLoading(false);
     } else {
       // Successful login - redirect to dashboard
@@ -137,7 +147,7 @@ export default function Login() {
 
         {/* Footer */}
         <div className="mt-6 text-center text-xs dark:text-gray-500 text-slate-500">
-          Secured by Supabase Auth • Demo Mode
+          Secured by Amazon Cognito • Demo Mode
         </div>
       </div>
     </div>

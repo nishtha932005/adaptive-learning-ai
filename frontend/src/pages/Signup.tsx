@@ -1,8 +1,7 @@
-import React, { useState } from "react";
-import { useNavigate, Link } from "react-router-dom";
+import React, { useEffect, useState } from "react";
+import { useNavigate, Link, useSearchParams } from "react-router-dom";
 import { Mail, Lock, User, Loader2, Rocket, Building2, ArrowRight } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
-import { supabase } from "../lib/supabase";
 import { motion, AnimatePresence } from "framer-motion";
 import { useTheme } from "../context/ThemeContext";
 import PersonalWizard from "../components/onboarding/PersonalWizard";
@@ -10,38 +9,61 @@ import PersonalWizard from "../components/onboarding/PersonalWizard";
 type SignupMode = "select" | "personal" | "organizational";
 
 export default function Signup() {
+  const [searchParams] = useSearchParams();
   const [mode, setMode] = useState<SignupMode>("select");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [fullName, setFullName] = useState("");
   const [classCode, setClassCode] = useState("");
+  const [verificationCode, setVerificationCode] = useState("");
+  const [showVerification, setShowVerification] = useState(false);
+  const [pendingEmail, setPendingEmail] = useState("");
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [verifyingCode, setVerifyingCode] = useState(false);
   const [orgInfo, setOrgInfo] = useState<{ id: string; name: string } | null>(null);
-  const { signUp } = useAuth();
+  const { signUp, confirmSignUp, resendSignUpCode, isAuthenticated } = useAuth();
   const { themeColor } = useTheme();
   const navigate = useNavigate();
+
+  useEffect(() => {
+    const verify = searchParams.get("verify");
+    const emailFromQuery = searchParams.get("email");
+    const message = searchParams.get("message");
+
+    if (verify === "1") {
+      setMode("personal");
+    }
+
+    if (emailFromQuery) {
+      setPendingEmail(emailFromQuery);
+      setEmail(emailFromQuery);
+    }
+
+    if (message) {
+      setSuccessMessage(message);
+    }
+  }, [searchParams]);
 
   const verifyClassCode = async (code: string) => {
     setVerifyingCode(true);
     setError(null);
     try {
-      const { data, error: verifyError } = await supabase.rpc("verify_class_code", {
-        code: code.toUpperCase().trim(),
-      });
+      const normalizedCode = code.toUpperCase().trim();
 
-      if (verifyError || !data || data.length === 0) {
+      if (normalizedCode.length < 4) {
         setError("Invalid class code. Please check and try again.");
         setVerifyingCode(false);
         return false;
       }
 
-      setOrgInfo({ id: data[0].id, name: data[0].name });
+      setOrgInfo({ id: normalizedCode, name: `Class ${normalizedCode}` });
       setVerifyingCode(false);
       return true;
     } catch (e: any) {
       setError("Failed to verify class code. Please try again.");
+      console.error("Class code verification error:", e);
       setVerifyingCode(false);
       return false;
     }
@@ -66,51 +88,116 @@ export default function Signup() {
     setLoading(true);
 
     try {
-      // Sign up with Supabase
+      console.log("Organizational signup attempt", {
+        email,
+        classCode: classCode.toUpperCase().trim(),
+      });
       const { error: signUpError, data } = await signUp(email, password, fullName);
 
       if (signUpError) {
+        console.error("Cognito signup failed:", signUpError);
+
+        if ((signUpError.message || "").toLowerCase().includes("already exists")) {
+          const { error: resendError } = await resendSignUpCode(email);
+
+          if (!resendError) {
+            setPendingEmail(email);
+            setShowVerification(true);
+            setSuccessMessage(
+              "Account exists but is not verified. We sent a new verification code to your email."
+            );
+            setError(null);
+            setLoading(false);
+            return;
+          }
+
+          const resendMessage = (resendError.message || "").toLowerCase();
+          if (resendMessage.includes("already confirmed") || resendMessage.includes("confirmed")) {
+            setError("Account already exists. Please sign in.");
+            setLoading(false);
+            return;
+          }
+        }
+
         setError(signUpError.message || "Signup failed");
         setLoading(false);
         return;
       }
 
-      if (data?.user) {
-        // Join organization
-        const { error: joinError } = await supabase.rpc("join_organization", {
-          student_uuid: data.user.id,
-          org_uuid: orgInfo.id,
-        });
-
-        if (joinError) {
-          console.error("Failed to join organization:", joinError);
-          setError("Account created but failed to join organization. Please contact support.");
-          setLoading(false);
-          return;
-        }
-
-        // Update student with class code
-        await supabase
-          .from("students")
-          .update({ class_code: classCode.toUpperCase().trim() })
-          .eq("id", data.user.id);
-
-        // Redirect to login
-        navigate("/login?message=Account created successfully. Please sign in.");
+      if (!data?.user?.id) {
+        setError("Signup completed but no user ID was returned. Check Cognito configuration.");
+        setLoading(false);
+        return;
       }
+
+      console.log("Organizational signup success", {
+        userId: data.user.id,
+        orgId: orgInfo.id,
+      });
+      setPendingEmail(email);
+      setShowVerification(true);
+      setSuccessMessage("Account created. Enter verification code sent to your email.");
+      setLoading(false);
     } catch (e: any) {
+      console.error("Organizational signup unexpected error:", e);
       setError(e?.message || "Signup failed");
       setLoading(false);
     }
   };
 
+  const handleConfirmSignup = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setLoading(true);
+
+    const emailToVerify = (pendingEmail || email).trim();
+    if (!emailToVerify) {
+      setError("Email is required for verification");
+      setLoading(false);
+      return;
+    }
+
+    const { error: confirmError } = await confirmSignUp(emailToVerify, verificationCode.trim());
+    if (confirmError) {
+      setError(confirmError.message || "Failed to verify code");
+      setLoading(false);
+      return;
+    }
+
+    setLoading(false);
+    navigate(
+      `/login?message=${encodeURIComponent("Account verified successfully. Please sign in.")}`
+    );
+  };
+
+  const handleResendVerificationCode = async () => {
+    const emailToVerify = (pendingEmail || email).trim();
+    if (!emailToVerify) {
+      setError("Please enter your email first");
+      return;
+    }
+
+    setError(null);
+    setLoading(true);
+    const { error: resendError } = await resendSignUpCode(emailToVerify);
+    if (resendError) {
+      setError(resendError.message || "Failed to resend verification code");
+      setLoading(false);
+      return;
+    }
+
+    setSuccessMessage("Verification code resent. Check your email.");
+    setLoading(false);
+  };
+
   if (mode === "personal") {
     return (
       <PersonalWizard
-        onComplete={async () => {
-          // Check if user is signed in, if so go to dashboard, otherwise login
-          const { data: { session } } = await supabase.auth.getSession();
-          if (session?.user) {
+        initialStep={searchParams.get("verify") === "1" ? 4 : 1}
+        initialEmail={searchParams.get("email") || ""}
+        initialMessage={searchParams.get("message")}
+        onComplete={() => {
+          if (isAuthenticated) {
             navigate("/dashboard");
           } else {
             navigate("/login?message=Account created! Please sign in to continue.");
@@ -218,6 +305,14 @@ export default function Signup() {
             >
               Already have an account? Sign in
             </Link>
+            <div className="mt-2">
+              <Link
+                to="/signup?verify=1"
+                className="text-sm text-slate-600 dark:text-slate-400 hover:text-primary"
+              >
+                Have a verification code? Verify account
+              </Link>
+            </div>
           </div>
         </div>
       </div>
@@ -254,6 +349,12 @@ export default function Signup() {
         {error && (
           <div className="mb-4 text-xs text-rose-600 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-lg px-4 py-2">
             {error}
+          </div>
+        )}
+
+        {successMessage && (
+          <div className="mb-4 text-xs text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-lg px-4 py-2">
+            {successMessage}
           </div>
         )}
 
@@ -325,6 +426,46 @@ export default function Signup() {
             )}
           </button>
         </form>
+
+        {showVerification && (
+          <form onSubmit={handleConfirmSignup} className="mt-6 space-y-4 border-t border-slate-200 dark:border-slate-700 pt-5">
+            <p className="text-xs text-slate-600 dark:text-slate-400">
+              Enter the verification code sent to {(pendingEmail || email) || "your email"}.
+            </p>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-2">
+                Verification Code
+              </label>
+              <input
+                type="text"
+                value={verificationCode}
+                onChange={(e) => setVerificationCode(e.target.value)}
+                required
+                placeholder="Enter code"
+                className="w-full px-4 py-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+              />
+            </div>
+
+            <div className="flex gap-2">
+              <button
+                type="submit"
+                disabled={loading || !verificationCode.trim()}
+                className="flex-1 px-6 py-2.5 rounded-lg bg-primary text-white font-semibold text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Verify Account
+              </button>
+              <button
+                type="button"
+                onClick={handleResendVerificationCode}
+                disabled={loading}
+                className="flex-1 px-6 py-2.5 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 font-semibold text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Resend Code
+              </button>
+            </div>
+          </form>
+        )}
       </motion.div>
     </div>
   );
