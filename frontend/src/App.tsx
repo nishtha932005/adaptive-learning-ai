@@ -16,6 +16,7 @@ import Settings from "./pages/Settings";
 import Dashboard from "./pages/Dashboard";
 import LessonViewer from "./pages/LessonViewer";
 import { useAuth } from "./context/AuthContext";
+import { CourseProvider } from "./context/CourseContext";
 
 function MentorRoute({ children }: { children: React.ReactNode }) {
   const { user } = useAuth();
@@ -31,8 +32,10 @@ function DashboardApp() {
     <DashboardLayout>
       <Routes>
         <Route path="/" element={<Dashboard />} />
+        <Route path="/overview" element={<Dashboard />} />
         <Route path="/study" element={<StudyRoomPage />} />
         <Route path="/courses" element={<CoursesLibrary />} />
+        <Route path="/courses/:id/module/:moduleIndex" element={<CoursePlayer />} />
         <Route path="/course/:id" element={<CoursePlayer />} />
         <Route path="/lesson/:chapterId" element={<LessonViewer />} />
         <Route path="/onboarding" element={<Onboarding />} />
@@ -62,44 +65,57 @@ function App() {
   return (
     <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <AuthProvider>
-        <Routes>
-          {/* Public Landing Page */}
-          <Route path="/" element={<Landing />} />
+        <CourseProvider>
+          <Routes>
+            {/* Public Landing Page */}
+            <Route path="/" element={<Landing />} />
 
-          {/* Public Auth Routes */}
-          <Route path="/login" element={<Login />} />
-          <Route path="/signup" element={<Signup />} />
+            {/* Public Auth Routes */}
+            <Route path="/login" element={<Login />} />
+            <Route path="/signup" element={<Signup />} />
 
-          {/* Authenticated non-dashboard flows */}
-          <Route
-            path="/onboarding"
-            element={
-              <ProtectedRoute>
-                <Onboarding />
-              </ProtectedRoute>
-            }
-          />
-          <Route
-            path="/mentor"
-            element={
-              <ProtectedRoute>
-                <MentorRoute>
-                  <MentorDashboard />
-                </MentorRoute>
-              </ProtectedRoute>
-            }
-          />
+            {/* Authenticated non-dashboard flows */}
+            <Route
+              path="/onboarding"
+              element={
+                <ProtectedRoute>
+                  <Onboarding />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/mentor"
+              element={
+                <ProtectedRoute>
+                  <MentorRoute>
+                    <MentorDashboard />
+                  </MentorRoute>
+                </ProtectedRoute>
+              }
+            />
 
-          {/* Protected Dashboard Routes */}
-          <Route
-            path="/dashboard/*"
-            element={
-              <ProtectedRoute>
-                <DashboardApp />
-              </ProtectedRoute>
-            }
-          />
-        </Routes>
+            {/* Protected Dashboard Routes */}
+            <Route
+              path="/dashboard/*"
+              element={
+                <ProtectedRoute>
+                  <DashboardApp />
+                </ProtectedRoute>
+              }
+            />
+
+            <Route
+              path="/overview"
+              element={
+                <ProtectedRoute>
+                  <DashboardLayout>
+                    <Dashboard />
+                  </DashboardLayout>
+                </ProtectedRoute>
+              }
+            />
+          </Routes>
+        </CourseProvider>
       </AuthProvider>
     </BrowserRouter>
   );

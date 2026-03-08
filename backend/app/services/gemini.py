@@ -27,7 +27,7 @@ def _ensure_gemini_configured() -> str:
 
     genai.configure(api_key=api_key)
 
-    model_id = os.getenv("GEMINI_MODEL_ID", "gemini-1.5-flash")
+    model_id = os.getenv("GEMINI_MODEL_ID", "gemini-2.0-flash-lite")
     return model_id
 
 
@@ -40,7 +40,7 @@ class GeminiService:
     """
 
     def __init__(self, model_id: Optional[str] = None) -> None:
-        self._model_id = model_id or os.getenv("GEMINI_MODEL_ID", "gemini-1.5-flash")
+        self._model_id = model_id or os.getenv("GEMINI_MODEL_ID", "gemini-2.0-flash-lite")
 
     def _get_model(self):
         model_id = _ensure_gemini_configured()
@@ -48,6 +48,33 @@ class GeminiService:
         if self._model_id:
             model_id = self._model_id
         return genai.GenerativeModel(model_id)
+
+    @staticmethod
+    def _extract_response_text(response: Any) -> str:
+        """Extract plain text from Gemini response payloads.
+
+        Gemini SDK often exposes text via response.text, but some responses only
+        include candidates/content parts.
+        """
+        direct_text = getattr(response, "text", None)
+        if isinstance(direct_text, str) and direct_text.strip():
+            return direct_text
+
+        candidates = getattr(response, "candidates", None) or []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            if not content:
+                continue
+            parts = getattr(content, "parts", None) or []
+            chunks: List[str] = []
+            for part in parts:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str) and part_text.strip():
+                    chunks.append(part_text)
+            if chunks:
+                return "\n".join(chunks)
+
+        return ""
 
     async def generate_content(self, topic: str, difficulty: str) -> str:
         """
@@ -57,7 +84,10 @@ class GeminiService:
         """
         prompt: str
         diff = (difficulty or "").lower()
-        if diff in ("easy", "simplified", "beginner"):
+        if diff in ("raw", "structured", "json"):
+            # Caller-provided prompt should pass through unchanged.
+            prompt = topic
+        elif diff in ("easy", "simplified", "beginner"):
             prompt = f"Explain {topic} to a 10-year-old using clear analogies and simple language."
         elif diff in ("hard", "advanced", "phd"):
             prompt = f"Provide a PhD-level challenge question and short discussion prompt for the topic: {topic}."
@@ -67,7 +97,7 @@ class GeminiService:
         try:
             model = self._get_model()
             response = await model.generate_content_async(prompt)
-            text = getattr(response, "text", None) or ""
+            text = self._extract_response_text(response)
             if not text:
                 raise RuntimeError("Gemini returned an empty response.")
             return text

@@ -3,9 +3,12 @@ import { motion } from "framer-motion";
 import { CheckCircle2, Play, Lock, Sword, Video, HelpCircle, Loader2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useTheme } from "../../context/ThemeContext";
-import { getSagaProgress, type SagaNode } from "../../services/sagaService";
+import type { SagaNode } from "../../services/sagaService";
 import { useAuth } from "../../context/AuthContext";
-import { supabase } from "../../lib/supabase";
+import { useCourses } from "../../context/CourseContext";
+
+const ONBOARDING_GOAL_STORAGE_KEY = "onboarding_learning_goal";
+const AUTO_GENERATE_TIMEOUT_MS = 15000;
 
 function SagaItem({ 
   node, 
@@ -46,6 +49,13 @@ function SagaItem({
   const handleClick = () => {
     // Allow clicking on active and completed nodes
     if (node.status === "locked") {
+      return;
+    }
+
+    const courseId = node.action_params?.courseId;
+    const moduleIndex = node.action_params?.moduleIndex;
+    if (node.action_type === "course" && courseId !== undefined && moduleIndex !== undefined) {
+      navigate(`/dashboard/courses/${courseId}/module/${moduleIndex}`);
       return;
     }
 
@@ -193,73 +203,171 @@ function SagaItem({
   );
 }
 
-export default function SagaMap() {
+export default function SagaMap({ onOpenGenerator }: { onOpenGenerator?: () => void }) {
   const { user } = useAuth();
+  const { latestGeneratedCourse, addGeneratedCourse } = useCourses();
   const [nodes, setNodes] = useState<SagaNode[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [generating, setGenerating] = useState(false);
+  const [autoGenerateChecked, setAutoGenerateChecked] = useState(false);
+  const cognitoUserId = (user as any)?.sub as string | undefined;
+
+  const mapCourseToNodes = (course: any): SagaNode[] => {
+    if (!course?.modules?.length) return [];
+
+    return course.modules.map((module: any, index: number) => {
+      const chapterCount = Array.isArray(module?.chapters) ? module.chapters.length : 0;
+      return {
+        id: `generated-${course.id || "course"}-module-${index + 1}`,
+        chapter_number: index + 1,
+        title: module?.title || `Module ${index + 1}`,
+        subtitle: `${chapterCount} chapter${chapterCount === 1 ? "" : "s"}`,
+        xp_reward: 400 + index * 50,
+        estimated_time_minutes: Math.max(10, chapterCount * 10),
+        type: "video",
+        prerequisite_chapter_id:
+          index > 0 ? `generated-${course.id || "course"}-module-${index}` : null,
+        course_id: course.id || "generated-course",
+        action_url: null,
+        action_type: "course",
+        action_params: {
+          source: "course-context",
+          courseId: course.id || "generated-course",
+          moduleIndex: index,
+          moduleTitle: module?.title || `Module ${index + 1}`,
+        },
+        status: index === 0 ? "active" : "locked",
+        completed_at: null,
+        xp_earned: 0,
+        time_spent_minutes: 0,
+      } as SagaNode;
+    });
+  };
+
+  const resolveLearningGoal = (): string => {
+    const userAny = user as any;
+    const fromUser =
+      userAny?.learningGoal ||
+      userAny?.learning_goal ||
+      userAny?.attributes?.learningGoal ||
+      userAny?.attributes?.learning_goal ||
+      userAny?.attributes?.["custom:learning_goal"] ||
+      "";
+
+    if (typeof fromUser === "string" && fromUser.trim()) {
+      return fromUser.trim();
+    }
+
+    if (typeof window === "undefined") return "";
+
+    const userScopedId =
+      userAny?.sub || userAny?.userId || userAny?.id || userAny?.username || userAny?.signInDetails?.loginId;
+
+    if (userScopedId) {
+      const scopedGoal = window.localStorage.getItem(
+        `${ONBOARDING_GOAL_STORAGE_KEY}_${userScopedId}`
+      );
+      if (scopedGoal?.trim()) return scopedGoal.trim();
+    }
+
+    return (window.localStorage.getItem(ONBOARDING_GOAL_STORAGE_KEY) || "").trim();
+  };
+
+  const handleGenerateFromGoal = async (topic: string, signal?: AbortSignal) => {
+    const API_URL = (import.meta as any).env?.VITE_API_URL || "http://127.0.0.1:8000";
+    const studentId =
+      (user as any)?.sub || (user as any)?.userId || (user as any)?.id || (user as any)?.username;
+
+    const response = await fetch(`${API_URL}/api/ai/generate-course`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      signal,
+      body: JSON.stringify({
+        topic,
+        pace: "blitz",
+        student_id: studentId || "anonymous-student",
+      }),
+    });
+
+    if (!response.ok) {
+      const errorPayload = await response.json().catch(() => ({}));
+      throw new Error(errorPayload?.detail || "Failed to generate course from your learning goal.");
+    }
+
+    const payload = await response.json();
+    const generatedCourse = payload?.course;
+    const hasModules = Array.isArray(generatedCourse?.modules) && generatedCourse.modules.length > 0;
+    if (!hasModules) {
+      throw new Error("Generated course is missing modules.");
+    }
+
+    return addGeneratedCourse(generatedCourse);
+  };
 
   useEffect(() => {
-    let mounted = true;
-    (async () => {
-      if (!user?.id) {
+    const loadRoadmap = async () => {
+      setLoading(true);
+      setError(null);
+
+      // Branch 1: existing generated course is the source of truth.
+      if (latestGeneratedCourse?.modules?.length) {
+        const generatedNodes = mapCourseToNodes(latestGeneratedCourse);
+        setNodes(generatedNodes);
         setLoading(false);
+        setAutoGenerateChecked(true);
+
+        console.debug("[Overview] CourseContext roadmap loaded", {
+          userId: cognitoUserId,
+          modules: generatedNodes.length,
+          courseId: latestGeneratedCourse?.id,
+        });
         return;
       }
 
-      try {
-        // Check if user has personalized saga, if not generate it
-        const { data: student } = await supabase
-          .from("students")
-          .select("account_type, personalized_saga_created, learning_vibe")
-          .eq("id", user.id)
-          .single();
+      // Branch 2: no generated course yet, try auto-generation from user's learning goal.
+      const learningGoal = resolveLearningGoal();
+      if (learningGoal) {
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), AUTO_GENERATE_TIMEOUT_MS);
 
-        // If personal account with saga vibe but no personalized saga, generate it
-        if (student?.account_type === "personal" && 
-            student?.learning_vibe === "saga" && 
-            !student?.personalized_saga_created) {
-          setGenerating(true);
-          const { generatePersonalizedSaga } = await import("../../services/personalizationService");
-          await generatePersonalizedSaga(user.id);
-          setGenerating(false);
-        }
-
-        const sagaNodes = await getSagaProgress(user.id);
-        if (mounted) {
-          setNodes(sagaNodes);
-        }
-      } catch (e: any) {
-        console.error("Failed to load saga progress:", e);
-        if (mounted) {
-          setError(e?.message || "Failed to load your journey");
-        }
-      } finally {
-        if (mounted) {
+        try {
+          const createdCourse = await handleGenerateFromGoal(learningGoal, controller.signal);
+          const generatedNodes = mapCourseToNodes(createdCourse);
+          setNodes(generatedNodes);
+          setAutoGenerateChecked(true);
           setLoading(false);
+
+          console.debug("[Overview] Auto-generated roadmap from learning goal", {
+            userId: cognitoUserId,
+            learningGoal,
+            modules: generatedNodes.length,
+            courseId: createdCourse?.id,
+          });
+          return;
+        } catch (e: any) {
+          const isAbort = e?.name === "AbortError";
+          console.error("[Overview] Failed to auto-generate roadmap", {
+            reason: isAbort ? "timeout" : "request-error",
+            error: e,
+          });
+
+          // Fall back to CTA state instead of blocking Overview with an error.
+          setError(null);
+        } finally {
+          window.clearTimeout(timeoutId);
         }
       }
-    })();
 
-    return () => {
-      mounted = false;
+      // Branch 3: no existing course and no learning goal available.
+      setNodes([]);
+      setAutoGenerateChecked(true);
+      setLoading(false);
     };
-  }, [user?.id]);
 
-  if (generating) {
-    return (
-      <div className="flex flex-col items-center justify-center py-12">
-        <Loader2 className="w-8 h-8 animate-spin text-primary mb-4" />
-        <p className="text-sm font-semibold text-slate-900 dark:text-white mb-1">
-          Generating Your Personalized Journey
-        </p>
-        <p className="text-xs text-slate-600 dark:text-slate-400">
-          AI is crafting your unique learning path...
-        </p>
-      </div>
-    );
-  }
+    void loadRoadmap();
+  }, [addGeneratedCourse, cognitoUserId, latestGeneratedCourse, user]);
 
   if (loading) {
     return (
@@ -280,10 +388,16 @@ export default function SagaMap() {
     );
   }
 
-  if (nodes.length === 0) {
+  if (nodes.length === 0 && autoGenerateChecked) {
     return (
-      <div className="text-sm text-slate-600 dark:text-slate-400 text-center py-8">
-        No chapters available. Please contact support.
+      <div className="text-center py-8">
+        <button
+          type="button"
+          onClick={onOpenGenerator}
+          className="px-4 py-2 rounded-lg bg-primary text-white text-sm font-semibold shadow-sm hover:shadow-md"
+        >
+          Generate Course to start your roadmap
+        </button>
       </div>
     );
   }

@@ -1,6 +1,13 @@
 import os
+import json
+import re
+import asyncio
+from urllib.parse import quote_plus
 from fastapi import FastAPI, HTTPException
+from collections import Counter
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
+import requests
 
 from dotenv import load_dotenv
 
@@ -37,6 +44,8 @@ logging.info("Backend server starting up...")
 
 app = FastAPI(title="AI-Powered Adaptive Learning System")
 
+COURSE_GENERATION_TIMEOUT_SECONDS = int(os.getenv("COURSE_GENERATION_TIMEOUT_SECONDS", "20"))
+
 # CORS configuration - expanded for dev troubleshooting
 origins = [
     "http://localhost:5173",
@@ -54,8 +63,15 @@ app.add_middleware(
 )
 
 tutor = AdaptiveTutor()
-gemini_service = GeminiService()
+ai_service: Optional[GeminiService] = None
 personalization_service = PersonalizationService()
+
+
+def get_ai_service() -> GeminiService:
+    global ai_service
+    if ai_service is None:
+        ai_service = GeminiService()
+    return ai_service
 
 
 @app.get("/")
@@ -81,9 +97,7 @@ async def health_check():
 @app.get("/api/ai/models")
 async def list_models():
     """
-    Returns the list of available Gemini models that support generateContent.
-
-    Useful for debugging / selecting the right model ID in configuration.
+    Returns Gemini models that support content generation.
     """
     try:
         models = list_gemini_models()
@@ -91,6 +105,60 @@ async def list_models():
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return {"models": models}
+
+
+def _find_youtube_video_id(query: str) -> Optional[str]:
+    """Fetch YouTube search results HTML and extract the first non-shorts id."""
+    if not query or not query.strip():
+        return None
+
+    encoded = quote_plus(query.strip())
+    url = f"https://www.youtube.com/results?search_query={encoded}"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+
+    response = requests.get(url, headers=headers, timeout=10)
+    response.raise_for_status()
+
+    html = response.text
+    # Match canonical watch ids and avoid shorts where possible.
+    matches = re.findall(r"/watch\?v=([A-Za-z0-9_-]{11})", html)
+    if not matches:
+        return None
+
+    seen = set()
+    deduped = []
+    for vid in matches:
+        if vid not in seen:
+            seen.add(vid)
+            deduped.append(vid)
+
+    return deduped[0] if deduped else None
+
+
+@app.get("/api/video/search")
+async def search_video(topic: str):
+    """Resolve an embeddable YouTube video URL for a lesson topic."""
+    try:
+        video_id = _find_youtube_video_id(topic)
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Video search failed: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unexpected video search error: {exc}") from exc
+
+    if not video_id:
+        return {"video_url": None, "video_id": None}
+
+    return {
+        "video_id": video_id,
+        "video_url": f"https://www.youtube.com/embed/{video_id}",
+    }
 
 
 @app.get("/api/student/status", response_model=StudentStatus)
@@ -120,7 +188,8 @@ async def get_student_status():
 @app.post("/api/ai/explain", response_model=AIExplainResponse)
 async def explain_topic(payload: AIExplainRequest):
     """
-    Uses Gemini via AdaptiveTutor to generate an adaptive explanation or challenge.
+    Uses Gemini via AdaptiveTutor to generate an adaptive explanation or
+    challenge.
     """
     try:
         explanation = await tutor.get_adaptive_explanation(
@@ -135,10 +204,10 @@ async def explain_topic(payload: AIExplainRequest):
 @app.post("/api/generate", response_model=GenerateContentResponse)
 async def generate_content(payload: GenerateContentRequest):
     """
-    Generic Gemini endpoint used by the Study Room to generate lessons/challenges.
+    Generic AI endpoint backed by Gemini to generate lessons/challenges.
     """
     try:
-        content = await gemini_service.generate_content(
+        content = await get_ai_service().generate_content(
             topic=payload.topic, difficulty=payload.difficulty
         )
     except RuntimeError as exc:
@@ -153,7 +222,7 @@ async def ai_generate_lesson(payload: AIGenerateLessonRequest):
     MVP endpoint for the Study Room, backed by GeminiService.generate_lesson.
     """
     try:
-        content = await gemini_service.generate_lesson(
+        content = await get_ai_service().generate_lesson(
             topic=payload.topic, mode=payload.mode
         )
     except RuntimeError as exc:
@@ -165,16 +234,16 @@ async def ai_generate_lesson(payload: AIGenerateLessonRequest):
 @app.post("/api/ai/study-tool", response_model=StudyToolResponse)
 async def ai_study_tool(payload: StudyToolRequest):
     """
-    Multi-tool endpoint powering the Study Room 2.0.
-    Supports:
-      - explain
-      - summarize
-      - quiz
-      - socratic
+        Multi-tool endpoint powering the Study Room 2.0.
+        Supports:
+            - explain
+            - summarize
+            - quiz
+            - socratic
     """
     print(f"DEBUG: Received study-tool request: {payload.tool_type} for topic: {payload.topic}")
     try:
-        mode, content, quiz_items = await gemini_service.generate_study_tool(
+        mode, content, quiz_items = await get_ai_service().generate_study_tool(
             tool_type=payload.tool_type,
             topic=payload.topic,
             input_text=payload.input_text,
@@ -187,23 +256,22 @@ async def ai_study_tool(payload: StudyToolRequest):
     except RuntimeError as exc:
         error_msg = str(exc)
         # Check for quota errors
-        if "quota" in error_msg.lower() or "429" in error_msg:
-            raise HTTPException(
-                status_code=429,
-                detail="AI service quota exceeded. Please try again later."
-            ) from exc
+        if "quota" in error_msg.lower() or "429" in error_msg or "Throttling" in error_msg:
+            logging.warning("Study-tool quota limited; serving fallback mode=%s", payload.tool_type)
+            return _study_tool_fallback(payload)
         # Check for API key errors
-        if "GEMINI_API_KEY" in error_msg or "not set" in error_msg.lower():
-            raise HTTPException(
-                status_code=500,
-                detail="AI service not configured. Please check server configuration."
-            ) from exc
-        raise HTTPException(status_code=500, detail=f"AI service error: {error_msg}") from exc
+        if "credentials" in error_msg.lower() or "not set" in error_msg.lower() or "GEMINI" in error_msg.upper():
+            logging.warning("Study-tool Gemini not configured; serving fallback mode=%s", payload.tool_type)
+            return _study_tool_fallback(payload)
+
+        logging.warning("Study-tool runtime error; serving fallback mode=%s error=%s", payload.tool_type, error_msg)
+        return _study_tool_fallback(payload)
     except Exception as exc:
         import traceback
         print(f"Unexpected error in study-tool: {exc}")
         print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Failed to process study tool request: {str(exc)}") from exc
+        logging.error("Study-tool unexpected error; serving fallback mode=%s error=%s", payload.tool_type, str(exc))
+        return _study_tool_fallback(payload)
 
     print(f"DEBUG: Study-tool request completed successfully for {payload.tool_type}")
     return StudyToolResponse(mode=mode, content=content, quiz=quiz_items)
@@ -232,7 +300,7 @@ async def generate_course(payload: dict):
         
         pace_instruction = pace_instructions.get(pace, pace_instructions["moderate"])
 
-        # Generate course content using Gemini
+        # Generate course content using the shared AI service (Gemini)
         prompt = f"""You are an expert course creator. Create a comprehensive, engaging course on: {topic}
 
 Student Pace: {pace}
@@ -240,18 +308,16 @@ Student Pace: {pace}
 
 Return ONLY a valid JSON object (no markdown, no explanation) with this exact structure:
 {{
-  "title": "Course title (engaging and specific)",
-  "description": "Detailed course description (2-3 sentences)",
-  "difficulty": "beginner|intermediate|advanced",
-  "thumbnail_url": null,
+    "title": "Course Title",
+    "description": "Short description",
+
   "modules": [
     {{
-      "title": "Module title",
-      "description": "Module description",
-      "lessons": [
+            "title": "Module Name",
+            "chapters": [
         {{
-          "title": "Lesson title",
-          "content": "Detailed lesson content with explanations, examples, and key takeaways"
+                    "title": "Chapter Name",
+                    "lessons": ["lesson1", "lesson2"]
         }}
       ]
     }}
@@ -261,41 +327,32 @@ Return ONLY a valid JSON object (no markdown, no explanation) with this exact st
 Make it practical, engaging, and tailored to {pace} pace learning!"""
 
         try:
-            content = await gemini_service.generate_content(topic=prompt, difficulty="standard")
-        except RuntimeError as gemini_error:
+            content = await asyncio.wait_for(
+                get_ai_service().generate_content(topic=prompt, difficulty="raw"),
+                timeout=COURSE_GENERATION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logging.warning(
+                "Gemini generate-course timed out after %ss. Serving fallback course for topic=%s pace=%s",
+                COURSE_GENERATION_TIMEOUT_SECONDS,
+                topic,
+                pace,
+            )
+            return {"course": _create_fallback_course(topic, pace)}
+        except RuntimeError as ai_error:
             # Handle quota errors specifically
-            error_msg = str(gemini_error)
-            if "quota" in error_msg.lower() or "429" in error_msg:
-                raise HTTPException(
-                    status_code=429,
-                    detail="AI service quota exceeded. Please try again later or upgrade your plan."
-                ) from gemini_error
-            raise HTTPException(status_code=500, detail=f"AI generation failed: {error_msg}") from gemini_error
+            error_msg = str(ai_error)
+            if "quota" in error_msg.lower() or "429" in error_msg or "Throttling" in error_msg:
+                logging.warning(
+                    "Gemini generate-course quota/rate-limited. Serving fallback course for topic=%s pace=%s",
+                    topic,
+                    pace,
+                )
+                return {"course": _create_fallback_course(topic, pace)}
+            logging.error("Gemini generate-course runtime error: %s", error_msg)
+            return {"course": _create_fallback_course(topic, pace)}
         
-        # Parse JSON from response
-        import json
-        import re
-        
-        # Clean the response - remove markdown code blocks if present
-        cleaned_content = content.strip()
-        if cleaned_content.startswith("```json"):
-            cleaned_content = cleaned_content[7:]
-        elif cleaned_content.startswith("```"):
-            cleaned_content = cleaned_content[3:]
-        if cleaned_content.endswith("```"):
-            cleaned_content = cleaned_content[:-3]
-        cleaned_content = cleaned_content.strip()
-        
-        # Extract JSON
-        json_match = re.search(r'\{[\s\S]*\}', cleaned_content)
-        if json_match:
-            try:
-                course_data = json.loads(json_match.group())
-            except json.JSONDecodeError:
-                # Fallback if JSON parsing fails
-                course_data = _create_fallback_course(topic, pace)
-        else:
-            course_data = _create_fallback_course(topic, pace)
+        course_data = _parse_and_normalize_course(content=content, topic=topic, pace=pace)
 
         return {"course": course_data}
     except HTTPException:
@@ -309,12 +366,12 @@ Make it practical, engaging, and tailored to {pace} pace learning!"""
         print(traceback.format_exc())
         
         # Check for specific error types
-        if "quota" in error_msg.lower() or "429" in error_msg:
+        if "quota" in error_msg.lower() or "429" in error_msg or "Throttling" in error_msg:
             raise HTTPException(
                 status_code=429,
                 detail="AI service quota exceeded. Please try again later."
             ) from exc
-        if "GEMINI_API_KEY" in error_msg or "not set" in error_msg.lower():
+        if "credentials" in error_msg.lower() or "not set" in error_msg.lower() or "GEMINI" in error_msg.upper():
             raise HTTPException(
                 status_code=500,
                 detail="AI service not configured. Please check server configuration."
@@ -329,13 +386,18 @@ def _create_fallback_course(topic: str, pace: str) -> dict:
     
     modules = []
     for i in range(1, module_count + 1):
+        chapter_title = f"Chapter {i}.1: Foundations"
         modules.append({
             "title": f"Module {i}: {topic} Fundamentals" if i == 1 else f"Module {i}: Advanced {topic}",
             "description": f"Learn the key concepts of {topic}",
-            "lessons": [
+            "chapters": [
                 {
-                    "title": f"Lesson {i}.1: Introduction",
-                    "content": f"This lesson covers the fundamentals of {topic}. You'll learn the core concepts and how to apply them in practice."
+                    "title": chapter_title,
+                    "lessons": [
+                        f"Lesson {i}.1: Introduction to {topic}",
+                        f"Lesson {i}.2: Core concepts in {topic}",
+                        f"Lesson {i}.3: Practice and application"
+                    ]
                 }
             ]
         })
@@ -347,6 +409,247 @@ def _create_fallback_course(topic: str, pace: str) -> dict:
         "thumbnail_url": None,
         "modules": modules
     }
+
+
+def _strip_markdown_json_fences(text: str) -> str:
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+
+    return cleaned.strip()
+
+
+
+def _to_lesson_titles(raw_lessons: object, chapter_title: str, topic: str) -> list[str]:
+    if not isinstance(raw_lessons, list):
+        return [f"Introduction to {topic}"]
+
+    lesson_titles: list[str] = []
+    for idx, lesson in enumerate(raw_lessons, start=1):
+        if isinstance(lesson, str) and lesson.strip():
+            lesson_titles.append(lesson.strip())
+            continue
+
+        if isinstance(lesson, dict):
+            title = str(lesson.get("title") or lesson.get("name") or "").strip()
+            if title:
+                lesson_titles.append(title)
+                continue
+
+            content = str(lesson.get("content") or "").strip()
+            if content:
+                lesson_titles.append(f"{chapter_title} - Lesson {idx}")
+                continue
+
+        lesson_titles.append(f"{chapter_title} - Lesson {idx}")
+
+    return lesson_titles or [f"Introduction to {topic}"]
+
+
+def _normalize_course_payload(candidate: dict, topic: str, pace: str) -> dict:
+    title = str(candidate.get("title") or f"Complete Guide to {topic}").strip()
+    description = str(
+        candidate.get("description")
+        or f"A comprehensive course covering all aspects of {topic}, designed for {pace} pace learning."
+    ).strip()
+
+    raw_modules = candidate.get("modules")
+    if not isinstance(raw_modules, list) or not raw_modules:
+        return _create_fallback_course(topic, pace)
+
+    normalized_modules: list[dict] = []
+    for m_idx, module in enumerate(raw_modules, start=1):
+        if not isinstance(module, dict):
+            module = {}
+
+        module_title = str(module.get("title") or f"Module {m_idx}: {topic}").strip()
+        module_desc = str(module.get("description") or f"Key concepts for {module_title}").strip()
+
+        chapters_raw = module.get("chapters")
+        if not isinstance(chapters_raw, list) or not chapters_raw:
+            # Backward compatibility: old model output used module.lessons.
+            legacy_lessons = module.get("lessons")
+            chapters_raw = [
+                {
+                    "title": f"Chapter {m_idx}.1: Core Ideas",
+                    "lessons": legacy_lessons if isinstance(legacy_lessons, list) else [f"Introduction to {module_title}"],
+                }
+            ]
+
+        normalized_chapters: list[dict] = []
+        for c_idx, chapter in enumerate(chapters_raw, start=1):
+            if isinstance(chapter, str):
+                chapter = {"title": chapter, "lessons": [f"Introduction to {chapter}"]}
+            elif not isinstance(chapter, dict):
+                chapter = {}
+
+            chapter_title = str(chapter.get("title") or f"Chapter {m_idx}.{c_idx}").strip()
+            chapter_lessons = _to_lesson_titles(chapter.get("lessons"), chapter_title, topic)
+            normalized_chapters.append(
+                {
+                    "title": chapter_title,
+                    "lessons": chapter_lessons,
+                }
+            )
+
+        if not normalized_chapters:
+            normalized_chapters = [{"title": f"Chapter {m_idx}.1", "lessons": [f"Introduction to {module_title}"]}]
+
+        normalized_modules.append(
+            {
+                "title": module_title,
+                "description": module_desc,
+                "chapters": normalized_chapters,
+            }
+        )
+
+    return {
+        "title": title,
+        "description": description,
+        "difficulty": str(candidate.get("difficulty") or "intermediate"),
+        "thumbnail_url": candidate.get("thumbnail_url", None),
+        "modules": normalized_modules,
+    }
+
+
+def _extractive_summary_fallback(text: str, detail: Optional[str] = None) -> str:
+    """Create a lightweight extractive summary when AI is unavailable."""
+    cleaned = re.sub(r"\s+", " ", (text or "")).strip()
+    if not cleaned:
+        return "No input text provided."
+
+    sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+    sentences = [s.strip() for s in sentences if s and len(s.strip()) > 20]
+    if not sentences:
+        return cleaned[:400]
+
+    tokens = re.findall(r"[A-Za-z]{3,}", cleaned.lower())
+    stop_words = {
+        "the", "and", "for", "that", "with", "this", "from", "are", "was", "were", "have",
+        "has", "had", "you", "your", "but", "not", "can", "will", "into", "about", "their",
+        "they", "them", "our", "out", "how", "what", "when", "where", "which", "while", "also",
+    }
+    freq = Counter(t for t in tokens if t not in stop_words)
+
+    def score_sentence(sentence: str) -> float:
+        words = re.findall(r"[A-Za-z]{3,}", sentence.lower())
+        if not words:
+            return 0.0
+        return sum(freq.get(w, 0) for w in words) / max(len(words), 1)
+
+    ranked = sorted(
+        ((idx, s, score_sentence(s)) for idx, s in enumerate(sentences)),
+        key=lambda x: x[2],
+        reverse=True,
+    )
+
+    sentence_count = {"short": 3, "standard": 5, "deep": 8}.get((detail or "standard").lower(), 5)
+    chosen = sorted(ranked[: min(sentence_count, len(sentences))], key=lambda x: x[0])
+    key_points = [item[1] for item in chosen]
+
+    top_terms = [term for term, _ in freq.most_common(5)]
+    bullets = "\n".join(f"- {point}" for point in key_points)
+    terms_line = ", ".join(top_terms) if top_terms else "N/A"
+
+    return (
+        "Summary (fallback mode):\n"
+        f"{bullets}\n\n"
+        f"Key terms: {terms_line}"
+    )
+
+
+def _study_tool_fallback(payload: StudyToolRequest) -> StudyToolResponse:
+    mode = (payload.tool_type or "explain").lower()
+    topic = (payload.topic or "the topic").strip() or "the topic"
+
+    if mode == "summarize":
+        summary = _extractive_summary_fallback(payload.input_text or "", payload.detail)
+        return StudyToolResponse(mode="summarize", content=summary, quiz=None)
+
+    if mode == "visualize":
+        diagram_topic = topic.replace('"', "'")
+        mermaid = (
+            "```mermaid\n"
+            "flowchart TD\n"
+            f"    A[{diagram_topic}] --> B[Core Concepts]\n"
+            "    B --> C[Examples]\n"
+            "    C --> D[Practice]\n"
+            "    D --> E[Review]\n"
+            "```"
+        )
+        return StudyToolResponse(mode="visualize", content=mermaid, quiz=None)
+
+    if mode == "quiz":
+        return StudyToolResponse(
+            mode="quiz",
+            content=None,
+            quiz=[
+                {
+                    "question": f"What is the primary goal when learning {topic}?",
+                    "options": [
+                        "Memorize definitions only",
+                        "Understand concepts and apply them",
+                        "Avoid practice exercises",
+                        "Skip fundamentals",
+                    ],
+                    "correctAnswer": "Understand concepts and apply them",
+                },
+                {
+                    "question": f"Which approach best supports mastery in {topic}?",
+                    "options": [
+                        "Passive reading only",
+                        "No feedback loop",
+                        "Practice with reflection and iteration",
+                        "One-time review",
+                    ],
+                    "correctAnswer": "Practice with reflection and iteration",
+                },
+            ],
+        )
+
+    if mode == "socratic":
+        prompt = (
+            f"What do you already know about {topic}, and which part feels unclear?\n"
+            "What small example could you use to test your current understanding?"
+        )
+        return StudyToolResponse(mode="socratic", content=prompt, quiz=None)
+
+    explain = (
+        f"Fallback explanation for {topic}:\n"
+        "- Start from the core definition and why it matters.\n"
+        "- Break the topic into 2-3 sub-concepts.\n"
+        "- Apply one practical example and validate your understanding with a quick question."
+    )
+    return StudyToolResponse(mode="explain", content=explain, quiz=None)
+
+
+def _parse_and_normalize_course(content: str, topic: str, pace: str) -> dict:
+    cleaned_content = _strip_markdown_json_fences(content)
+
+    try:
+        parsed = json.loads(cleaned_content)
+        if isinstance(parsed, dict):
+            return _normalize_course_payload(parsed, topic, pace)
+    except json.JSONDecodeError:
+        pass
+
+    json_match = re.search(r"\{[\s\S]*\}", cleaned_content)
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group())
+            if isinstance(parsed, dict):
+                return _normalize_course_payload(parsed, topic, pace)
+        except json.JSONDecodeError:
+            pass
+
+    # Required for debugging malformed model output.
+    logging.error("Failed to parse Gemini course JSON. Raw output: %s", content)
+    return _create_fallback_course(topic, pace)
 
 
 @app.post("/api/ai/personalize-saga", response_model=PersonalizeSagaResponse)

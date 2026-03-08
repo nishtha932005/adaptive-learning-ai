@@ -1,7 +1,12 @@
 import React, { useMemo } from "react";
 import { motion } from "framer-motion";
 import { Flame } from "lucide-react";
-import type { DashboardStudent } from "../lib/supabase";
+
+type DashboardStudent = {
+  xp_points?: number;
+  study_streak_days?: number;
+  modules_finished?: number;
+};
 
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));

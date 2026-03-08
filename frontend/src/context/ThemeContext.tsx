@@ -12,7 +12,7 @@ type ThemeContextValue = {
 const ThemeContext = createContext<ThemeContextValue | undefined>(undefined);
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [isDark, setIsDark] = useState<boolean>(false);
+  const [isDark, setIsDark] = useState<boolean>(true);
   const [themeColor, setThemeColorState] = useState<ThemeColor>("orange");
 
   useEffect(() => {
@@ -20,7 +20,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     const storedMode = window.localStorage.getItem("theme-mode");
     const storedColor = window.localStorage.getItem("theme-color");
 
-    const darkEnabled = storedMode === "dark";
+    const darkEnabled = storedMode ? storedMode === "dark" : true;
     setIsDark(darkEnabled);
     if (darkEnabled) {
       document.documentElement.classList.add("dark");

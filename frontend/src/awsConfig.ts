@@ -36,4 +36,4 @@ export function ensureAmplifyConfigured() {
   isAmplifyConfigured = true;
 }
 
-ensureAmplifyConfigured();
+ensureAmplifyConfigured(); 

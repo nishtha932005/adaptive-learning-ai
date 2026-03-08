@@ -62,8 +62,8 @@ export default function Dashboard() {
   const courses = data?.courses ?? [];
   const primaryCourse = courses[0];
   const [activeQuest, setActiveQuest] = useState<any>(null);
-  const [accountType, setAccountType] = useState<"personal" | "organizational" | null>(null);
-  const [learningVibe, setLearningVibe] = useState<"saga" | "bootcamp" | "academic" | null>(null);
+  const [accountType, setAccountType] = useState<"personal" | "organizational">("personal");
+  const [learningVibe, setLearningVibe] = useState<"saga" | "bootcamp" | "academic">("saga");
   const [orgName, setOrgName] = useState<string | null>(null);
   const [showGenerator, setShowGenerator] = useState(false);
 
@@ -240,7 +240,7 @@ export default function Dashboard() {
             <AssignmentsFeed onStart={() => setManualCredits(c => c + 5)} />
           ) : (
             <>
-              {learningVibe === "saga" && <SagaMap />}
+              {learningVibe === "saga" && <SagaMap onOpenGenerator={() => setShowGenerator(true)} />}
               {learningVibe === "bootcamp" && <BootcampView courses={courses} />}
               {learningVibe === "academic" && <AcademicView courses={courses} />}
               {!learningVibe && (

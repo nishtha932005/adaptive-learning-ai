@@ -1,14 +1,15 @@
 import React, { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { X, Sparkles, Loader2, BookOpen } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
-import { supabase } from "../lib/supabase";
 import { useTheme } from "../context/ThemeContext";
+import { useCourses, type GeneratedCourse } from "../context/CourseContext";
 
 interface AICourseGeneratorProps {
   isOpen: boolean;
   onClose: () => void;
-  onCourseGenerated?: () => void;
+  onCourseGenerated?: (course?: GeneratedCourse) => void;
 }
 
 export default function AICourseGenerator({
@@ -16,8 +17,10 @@ export default function AICourseGenerator({
   onClose,
   onCourseGenerated,
 }: AICourseGeneratorProps) {
-  const { user } = useAuth();
+  const navigate = useNavigate();
+  const { user, isAuthenticated } = useAuth();
   const { themeColor } = useTheme();
+  const { addGeneratedCourse } = useCourses();
   const [topic, setTopic] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -29,7 +32,7 @@ export default function AICourseGenerator({
       return;
     }
 
-    if (!user?.id) {
+    if (!isAuthenticated || !user) {
       setError("You must be logged in to generate courses");
       return;
     }
@@ -39,17 +42,17 @@ export default function AICourseGenerator({
     setSuccess(false);
 
     try {
-      // Get user's learning preferences
-      const { data: student } = await supabase
-        .from("students")
-        .select("preferred_pace")
-        .eq("id", user.id)
-        .single();
-
-      const pace = student?.preferred_pace || "moderate";
+      // For now, use a default pace. In future this can
+      // be driven by backend preferences or settings.
+      const pace = "moderate";
 
       // Call backend API to generate course
-      const API_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+      const API_URL = (import.meta as any).env?.VITE_API_URL || "http://127.0.0.1:8000";
+      const studentId = (user as any)?.userId || (user as any)?.id || (user as any)?.username;
+
+      if (!studentId) {
+        throw new Error("Unable to resolve authenticated user id for course generation.");
+      }
       const response = await fetch(`${API_URL}/api/ai/generate-course`, {
         method: "POST",
         headers: {
@@ -58,7 +61,7 @@ export default function AICourseGenerator({
         body: JSON.stringify({
           topic: topic.trim(),
           pace: pace,
-          student_id: user.id,
+          student_id: studentId,
         }),
       });
 
@@ -74,44 +77,36 @@ export default function AICourseGenerator({
         throw new Error(errorMessage);
       }
 
-      const { course } = await response.json();
+      const data = await response.json();
+      console.log("AI course response:", data);
 
-      // Save course to database
-      const { data: courseData, error: courseError } = await supabase
-        .from("courses")
-        .insert({
-          title: course.title,
-          description: course.description,
-          difficulty: course.difficulty || "intermediate",
-          thumbnail_url: course.thumbnail_url || null,
-          total_modules: course.modules?.length || 0,
-        })
-        .select()
-        .single();
+      const course: GeneratedCourse | undefined = data?.course;
+      const hasModules = Array.isArray(course?.modules) && course!.modules.length > 0;
+      const hasChapters = !!course?.modules?.some(
+        (module) => Array.isArray(module?.chapters) && module.chapters.length > 0
+      );
 
-      if (courseError) {
-        throw new Error("Failed to save course: " + courseError.message);
+      if (!course || !hasModules || !hasChapters) {
+        throw new Error("Generated course is missing modules/chapters. Please try again.");
       }
 
-      // Enroll student in the course
-      if (courseData) {
-        await supabase.from("enrollments").insert({
-          student_id: user.id,
-          course_id: courseData.id,
-          progress_pct: 0,
-          is_current_focus: true,
-        });
-      }
+      const savedCourse = addGeneratedCourse(course);
+      console.debug("[AI Course] Stored generated course in CourseContext", {
+        id: savedCourse.id,
+        title: savedCourse.title,
+      });
 
       setSuccess(true);
       setTimeout(() => {
         onClose();
         setTopic("");
         setSuccess(false);
-        onCourseGenerated?.();
+        onCourseGenerated?.(savedCourse);
+        navigate("/overview");
       }, 2000);
     } catch (e: any) {
       setError(e?.message || "Failed to generate course. Please try again.");
+    } finally {
       setLoading(false);
     }
   };

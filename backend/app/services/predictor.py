@@ -22,19 +22,54 @@ def predict_student_risk(interactions: int, last_score: int, days_overdue: int) 
 
 import os
 import pickle
+import joblib
 import pandas as pd
 import numpy as np
 
 # Load model relative to this file
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "..", "student_progress_model.pkl")
 
-try:
-    with open(MODEL_PATH, "rb") as f:
-        _ml_model = pickle.load(f)
-    print(f"✅ ML Model loaded from {MODEL_PATH}")
-except Exception as e:
-    print(f"⚠️ Failed to load ML model: {e}")
-    _ml_model = None
+def _extract_predictor(candidate):
+    """Return a usable model object that exposes .predict, else None."""
+    if candidate is None:
+        return None
+
+    if hasattr(candidate, "predict"):
+        return candidate
+
+    if isinstance(candidate, dict):
+        for key in ("model", "estimator", "classifier", "regressor"):
+            nested = candidate.get(key)
+            if hasattr(nested, "predict"):
+                return nested
+
+    return None
+
+
+def _load_ml_model(path: str):
+    def _pickle_loader(p: str):
+        with open(p, "rb") as f:
+            return pickle.load(f)
+
+    loaders = [joblib.load, _pickle_loader]
+
+    for loader in loaders:
+        try:
+            loaded = loader(path)
+            model = _extract_predictor(loaded)
+            if model is not None:
+                print(f"✅ ML Model loaded from {path}")
+                return model
+
+            loaded_type = type(loaded).__name__
+            print(f"⚠️ Loaded artifact is not a predictor (type={loaded_type}). Using fallback.")
+        except Exception as e:
+            print(f"⚠️ Model load attempt failed via {loader.__name__}: {e}")
+
+    return None
+
+
+_ml_model = _load_ml_model(MODEL_PATH)
 
 
 def predict_final_result(

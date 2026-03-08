@@ -21,7 +21,7 @@ type ToastState = {
 };
 
 export default function CoursePlayer() {
-  const { id } = useParams<{ id: string }>();
+  const { id, moduleIndex } = useParams<{ id: string; moduleIndex: string }>();
   const navigate = useNavigate();
   const { user } = useAuth();
 
@@ -48,9 +48,16 @@ export default function CoursePlayer() {
         setCourse(data);
         setModules(data.modules);
         if (data.modules.length > 0) {
-          setActiveModuleId(data.modules[0].id);
-          if (data.modules[0].lessons.length > 0) {
-            setActiveLessonId(data.modules[0].lessons[0].id);
+          const parsedModuleIndex = Number.isFinite(Number(moduleIndex)) ? Number(moduleIndex) : 0;
+          const safeModuleIndex = Math.min(
+            Math.max(parsedModuleIndex, 0),
+            data.modules.length - 1
+          );
+          const initialModule = data.modules[safeModuleIndex] || data.modules[0];
+
+          setActiveModuleId(initialModule.id);
+          if (initialModule.lessons.length > 0) {
+            setActiveLessonId(initialModule.lessons[0].id);
           }
         }
       } catch (e: any) {
@@ -59,7 +66,7 @@ export default function CoursePlayer() {
         setLoading(false);
       }
     })();
-  }, [id]);
+  }, [id, moduleIndex]);
 
   // Simple watch-time tracker: counts seconds while video is "playing".
   useEffect(() => {

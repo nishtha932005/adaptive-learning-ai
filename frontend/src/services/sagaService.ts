@@ -1,5 +1,19 @@
 import { supabase } from "../lib/supabase";
 
+const GENERATED_COURSES_STORAGE_KEY = "ai_generated_courses_v1";
+
+type GeneratedCourse = {
+  id?: string;
+  title?: string;
+  modules?: Array<{
+    title?: string;
+    chapters?: Array<{
+      title?: string;
+      lessons?: Array<string | { title?: string; content?: string }>;
+    }>;
+  }>;
+};
+
 export interface SagaChapter {
   id: string;
   chapter_number: number;
@@ -32,11 +46,83 @@ export interface SagaNode extends SagaChapter {
   time_spent_minutes: number;
 }
 
+
+function getGeneratedSagaNodes(studentId: string): SagaNode[] {
+  if (typeof window === "undefined") return [];
+
+  try {
+    const raw = window.localStorage.getItem(GENERATED_COURSES_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    const courses: GeneratedCourse[] = Array.isArray(parsed) ? parsed : [];
+    const latest = courses[0];
+
+    if (!latest || !Array.isArray(latest.modules)) return [];
+
+    const flatChapters = latest.modules.flatMap((module, moduleIndex) => {
+      const moduleTitle = String(module?.title || `Module ${moduleIndex + 1}`);
+      const chapters = Array.isArray(module?.chapters) ? module.chapters : [];
+
+      return chapters.map((chapter, chapterIndex) => {
+        const chapterTitle = String(chapter?.title || `Chapter ${chapterIndex + 1}`);
+        const lessons = Array.isArray(chapter?.lessons) ? chapter.lessons : [];
+        const lessonCount = Math.max(1, lessons.length);
+        const chapterNumber = moduleIndex * 10 + chapterIndex + 1;
+
+        return {
+          id: `generated-${latest.id || "course"}-m${moduleIndex + 1}-c${chapterIndex + 1}`,
+          chapter_number: chapterNumber,
+          title: chapterTitle,
+          subtitle: `${moduleTitle} - ${lessonCount} lesson${lessonCount === 1 ? "" : "s"}`,
+          xp_reward: lessonCount * 25,
+          estimated_time_minutes: lessonCount * 12,
+          type: "video" as const,
+          prerequisite_chapter_id: chapterNumber > 1
+            ? `generated-${latest.id || "course"}-m${moduleIndex + 1}-c${chapterIndex}`
+            : null,
+          course_id: String(latest.id || "generated-course"),
+          action_url: null,
+          action_type: "study" as const,
+          action_params: {
+            source: "generated-course",
+            studentId,
+            module: moduleTitle,
+            chapter: chapterTitle,
+          },
+          status: "locked" as const,
+          completed_at: null,
+          xp_earned: 0,
+          time_spent_minutes: 0,
+        };
+      });
+    });
+
+    return flatChapters.map((node, index) => ({
+      ...node,
+      status: index === 0 ? "active" : "locked",
+    }));
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Fetch all saga chapters with student's progress
  * Checks for personalized chapters first, falls back to default chapters
  */
 export async function getSagaProgress(studentId: string): Promise<SagaNode[]> {
+  const generatedNodes = getGeneratedSagaNodes(studentId);
+  if (generatedNodes.length > 0) {
+    console.debug("[Saga] Using generated course chapters for Overview timeline", {
+      studentId,
+      nodes: generatedNodes.length,
+    });
+    return generatedNodes;
+  }
+
+  console.debug("[Saga] No generated chapters found. Falling back to Supabase saga tables", {
+    studentId,
+  });
+
   // First, check if student has personalized chapters
   const { data: personalizedChapters, error: personalizedError } = await supabase
     .from("personalized_saga_chapters")
@@ -45,6 +131,10 @@ export async function getSagaProgress(studentId: string): Promise<SagaNode[]> {
     .order("chapter_number", { ascending: true });
 
   if (!personalizedError && personalizedChapters && personalizedChapters.length > 0) {
+    console.debug("[Saga] Using personalized saga chapters from Supabase", {
+      studentId,
+      count: personalizedChapters.length,
+    });
     // Use personalized chapters
     const { data: progress, error: progressError } = await supabase
       .from("saga_progress")
@@ -100,6 +190,11 @@ export async function getSagaProgress(studentId: string): Promise<SagaNode[]> {
   if (!chapters || chapters.length === 0) {
     return [];
   }
+
+  console.debug("[Saga] Using default saga chapters from Supabase", {
+    studentId,
+    count: chapters.length,
+  });
 
   // Fetch student's progress
   const { data: progress, error: progressError } = await supabase

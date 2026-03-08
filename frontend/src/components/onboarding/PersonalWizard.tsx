@@ -4,6 +4,8 @@ import { useAuth } from "../../context/AuthContext";
 import { useTheme } from "../../context/ThemeContext";
 import { Loader2, Sparkles, Target, Zap, ArrowRight, ArrowLeft, Mail } from "lucide-react";
 
+const ONBOARDING_GOAL_STORAGE_KEY = "onboarding_learning_goal";
+
 type Step = 1 | 2 | 3 | 4;
 
 interface PersonalWizardProps {
@@ -35,6 +37,20 @@ export default function PersonalWizard({
   const [vibe, setVibe] = useState<"saga" | "bootcamp" | "academic" | null>(null);
   const [pace, setPace] = useState<"blitz" | "moderate" | "deep" | null>(null);
   const [verificationCode, setVerificationCode] = useState("");
+
+  const persistLearningGoal = () => {
+    const trimmedGoal = goal.trim();
+    if (!trimmedGoal || typeof window === "undefined") return;
+
+    // Keep a global fallback and user-scoped key so Overview can resolve reliably.
+    window.localStorage.setItem(ONBOARDING_GOAL_STORAGE_KEY, trimmedGoal);
+
+    const userScopedId =
+      (user as any)?.sub || (user as any)?.userId || (user as any)?.id || email.trim() || null;
+    if (userScopedId) {
+      window.localStorage.setItem(`${ONBOARDING_GOAL_STORAGE_KEY}_${userScopedId}`, trimmedGoal);
+    }
+  };
 
   const next = async () => {
     setError(null);
@@ -111,6 +127,7 @@ export default function PersonalWizard({
     if (step < 4) {
       setStep((s) => (s + 1) as Step);
     } else {
+      persistLearningGoal();
       onComplete();
     }
   };
