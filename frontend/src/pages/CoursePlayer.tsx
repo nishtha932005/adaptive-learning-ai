@@ -13,19 +13,134 @@ import ConfettiExplosion from "react-confetti-explosion";
 import { useAuth } from "../context/AuthContext";
 import { supabase } from "../lib/supabase";
 import type { Course, Module, Lesson } from "../types";
-import { getCourseById } from "../services/courseService";
+import { useCourses, type GeneratedCourse } from "../context/CourseContext";
 
 type ToastState = {
   message: string;
   visible: boolean;
 };
 
+function toEmbedUrl(videoId: string): string {
+  return `https://www.youtube.com/embed/${videoId}`;
+}
+
+function buildLessonsFromModule(module: any, moduleIndex: number): Lesson[] {
+  const chapters = Array.isArray(module?.chapters) ? module.chapters : [];
+
+  return chapters.map((chapter: any, chapterIndex: number) => {
+    const videoId = String(chapter?.videoId || chapter?.video_id || "").trim();
+    const chapterTitle = String(chapter?.title || `Chapter ${moduleIndex + 1}.${chapterIndex + 1}`).trim();
+    const videoUrl = videoId ? toEmbedUrl(videoId) : "";
+
+    return {
+      id: `m${moduleIndex + 1}-c${chapterIndex + 1}`,
+      title: chapterTitle,
+      duration: "10:00",
+      videoUrl,
+      isCompleted: false,
+    };
+  });
+}
+
+function mapGeneratedCourseToPlayerModules(course: GeneratedCourse | null): Module[] {
+  if (!course?.modules?.length) return [];
+
+  return course.modules.map((module, moduleIndex) => {
+    const lessons = buildLessonsFromModule(module, moduleIndex);
+    return {
+      id: `${course.id || "generated"}-m${moduleIndex + 1}`,
+      title: module.title || `Module ${moduleIndex + 1}`,
+      lessons,
+    };
+  });
+}
+
+function DynamicYouTubeEmbed({ lessonTitle }: { lessonTitle: string }) {
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!lessonTitle) return;
+
+    let cancelled = false;
+
+    const fetchVideo = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const API_URL = (import.meta as any).env?.VITE_API_URL || "http://127.0.0.1:8000";
+        const query = `${lessonTitle} programming tutorial`;
+        const response = await fetch(
+          `${API_URL}/api/video/search?topic=${encodeURIComponent(query)}`
+        );
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        const url = data?.video_url || null;
+        if (!cancelled) {
+          setVideoUrl(url);
+          if (!url) {
+            setError("No video found for this lesson.");
+          }
+        }
+      } catch (e: any) {
+        if (!cancelled) {
+          setError(e?.message || "Failed to load video.");
+          setVideoUrl(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    };
+
+    fetchVideo();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [lessonTitle]);
+
+  if (loading && !videoUrl) {
+    return (
+      <div className="absolute inset-0 flex items-center justify-center bg-black">
+        <span className="text-xs text-slate-300">Loading lesson video…</span>
+      </div>
+    );
+  }
+
+  if (!videoUrl) {
+    return (
+      <div className="absolute inset-0 flex items-center justify-center bg-black">
+        <span className="text-xs text-slate-400">
+          {error || "No video available for this lesson yet."}
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <iframe
+      className="absolute inset-0 w-full h-full"
+      src={videoUrl}
+      title={lessonTitle}
+      allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+      allowFullScreen
+    />
+  );
+}
+
 export default function CoursePlayer() {
   const { id, moduleIndex } = useParams<{ id: string; moduleIndex: string }>();
   const navigate = useNavigate();
   const { user } = useAuth();
+  const { generatedCourses, latestGeneratedCourse } = useCourses();
 
-  const [course, setCourse] = useState<Course | null>(null);
   const [modules, setModules] = useState<Module[]>([]);
   const [activeModuleId, setActiveModuleId] = useState<string | null>(null);
   const [activeLessonId, setActiveLessonId] = useState<string | null>(null);
@@ -36,37 +151,47 @@ export default function CoursePlayer() {
   });
   const [watchSeconds, setWatchSeconds] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        setLoading(true);
-        const courseId = id || "advanced-neural-networks";
-        const data = await getCourseById(courseId);
-        setCourse(data);
-        setModules(data.modules);
-        if (data.modules.length > 0) {
-          const parsedModuleIndex = Number.isFinite(Number(moduleIndex)) ? Number(moduleIndex) : 0;
-          const safeModuleIndex = Math.min(
-            Math.max(parsedModuleIndex, 0),
-            data.modules.length - 1
-          );
-          const initialModule = data.modules[safeModuleIndex] || data.modules[0];
+  const generatedCourse = useMemo(() => {
+    if (!generatedCourses.length) return latestGeneratedCourse;
+    if (!id) return latestGeneratedCourse;
+    return generatedCourses.find((course) => String(course.id) === id) || latestGeneratedCourse;
+  }, [generatedCourses, id, latestGeneratedCourse]);
 
-          setActiveModuleId(initialModule.id);
-          if (initialModule.lessons.length > 0) {
-            setActiveLessonId(initialModule.lessons[0].id);
-          }
-        }
-      } catch (e: any) {
-        setError(e?.message || "Unable to load course");
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, [id, moduleIndex]);
+  const course = useMemo<Course | null>(() => {
+    if (!generatedCourse) return null;
+    return {
+      id: String(generatedCourse.id || "generated-course"),
+      title: generatedCourse.title,
+      description: generatedCourse.description,
+      thumbnail: "",
+      modules: [],
+    };
+  }, [generatedCourse]);
+
+  const generatedModules = useMemo(
+    () => mapGeneratedCourseToPlayerModules(generatedCourse),
+    [generatedCourse]
+  );
+
+  useEffect(() => {
+    if (!generatedModules.length) {
+      setModules([]);
+      setError("Course not found or not configured yet.");
+      return;
+    }
+
+    setError(null);
+    setModules(generatedModules);
+
+    const parsedModuleIndex = Number.isFinite(Number(moduleIndex)) ? Number(moduleIndex) : 0;
+    const safeModuleIndex = Math.min(Math.max(parsedModuleIndex, 0), generatedModules.length - 1);
+    const initialModule = generatedModules[safeModuleIndex] || generatedModules[0];
+
+    setActiveModuleId(initialModule.id);
+    setActiveLessonId(initialModule.lessons[0]?.id || null);
+  }, [generatedModules, moduleIndex]);
 
   // Simple watch-time tracker: counts seconds while video is "playing".
   useEffect(() => {
@@ -102,10 +227,22 @@ export default function CoursePlayer() {
     (item) => item.lesson.id === activeLesson?.id
   );
 
+  const moduleIndexById = useMemo(() => {
+    const idxMap: Record<string, number> = {};
+    modules.forEach((module, idx) => {
+      idxMap[module.id] = idx;
+    });
+    return idxMap;
+  }, [modules]);
+
   const goToLesson = (moduleId: string, lesson: Lesson) => {
     if (lesson.isLocked) return;
     setActiveModuleId(moduleId);
     setActiveLessonId(lesson.id);
+
+    if (!course?.id) return;
+    const nextModuleIndex = moduleIndexById[moduleId] ?? 0;
+    navigate(`/dashboard/course/${course.id}/module/${nextModuleIndex}`);
   };
 
   const goPrev = () => {
@@ -187,14 +324,6 @@ export default function CoursePlayer() {
   const isFirst = currentIndex <= 0;
   const isLast = currentIndex === -1 || currentIndex >= allLessons.length - 1;
 
-  if (loading) {
-    return (
-      <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center">
-        <span className="text-sm text-slate-400">Loading course...</span>
-      </div>
-    );
-  }
-
   if (error || !course || !activeModule || !activeLesson) {
     return (
       <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center">
@@ -275,7 +404,12 @@ export default function CoursePlayer() {
                 <button
                   type="button"
                   className="w-full flex items-center justify-between px-3 py-2 text-left text-xs font-semibold text-slate-200 bg-slate-900/80 rounded-t-xl"
-                  onClick={() => setActiveModuleId(module.id)}
+                  onClick={() => {
+                    setActiveModuleId(module.id);
+                    setActiveLessonId(module.lessons[0]?.id || null);
+                    const nextModuleIndex = moduleIndexById[module.id] ?? 0;
+                    navigate(`/dashboard/course/${course.id}/module/${nextModuleIndex}`);
+                  }}
                 >
                   <span className="truncate">{module.title}</span>
                   <ChevronRight
@@ -340,13 +474,7 @@ export default function CoursePlayer() {
           {/* Video Area */}
           <section className="bg-slate-900/80 rounded-2xl border border-white/10 shadow-2xl overflow-hidden">
             <div className="relative w-full" style={{ paddingTop: "56.25%" }}>
-              <iframe
-                className="absolute inset-0 w-full h-full"
-                src={activeLesson.videoUrl}
-                title={activeLesson.title}
-                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                allowFullScreen
-              />
+              <DynamicYouTubeEmbed lessonTitle={activeLesson.title} />
             </div>
           </section>
 

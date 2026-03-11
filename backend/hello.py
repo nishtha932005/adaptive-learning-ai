@@ -1,7 +1,15 @@
-print("Hello World")
-import google.generativeai as genai
+import os
 
-genai.configure(api_key="AIzaSyBzSKklgQE3a6rb34iswonkAFTlhI9C_xA")
+from dotenv import load_dotenv
+from google import genai
 
-for m in genai.list_models():
-    print(m.name)
+load_dotenv()
+
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    raise RuntimeError("GEMINI_API_KEY is not set.")
+
+client = genai.Client(api_key=api_key)
+
+for m in client.models.list():
+    print(getattr(m, "name", ""))

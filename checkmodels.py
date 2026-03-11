@@ -1,30 +1,32 @@
-import google.generativeai as genai
+import os
 
-# ==========================================
-# 👇 PASTE YOUR API KEY INSIDE THE QUOTES 👇
-# ==========================================
-MY_API_KEY = "AIzaSyBx5aUul7-p5ADAVau42Ww1XI0LIKr9E1M"
+from google import genai
 
-print(f"🔑 Authenticating with key: {MY_API_KEY[:5]}...*******")
+MY_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not MY_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is not set.")
+
+print(f"Authenticating with key prefix: {MY_API_KEY[:5]}...*******")
 
 try:
-    genai.configure(api_key=MY_API_KEY)
+    client = genai.Client(api_key=MY_API_KEY)
 
-    print("\n✅ SUCCESS: API Key is valid.")
-    print("📋 Here are the models you can use:\n")
+    print("\nSUCCESS: API key is valid.")
+    print("Available models:\n")
     
     found_any = False
-    for m in genai.list_models():
-        # We only care about models that can generate text/chat
-        if 'generateContent' in m.supported_generation_methods:
-            print(f"   👉 {m.name}")
+    for m in client.models.list():
+        supported = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None) or []
+        supported_norm = {str(item).lower() for item in supported}
+        if "generatecontent" in supported_norm or "generate_content" in supported_norm or "gemini" in getattr(m, "name", "").lower():
+            print(f"   {getattr(m, 'name', '')}")
             found_any = True
             
     if not found_any:
-        print("⚠️ No text-generation models found. This is unusual.")
+        print("No text-generation models found.")
         
-    print("\n💡 ACTION STEP: Copy one of the names above (e.g., 'models/gemini-1.5-flash')")
-    print("   and paste it into 'backend/app/services/gemini.py'")
+    print("\nUse one of the model names above in GEMINI_MODEL_ID if needed.")
 
 except Exception as e:
-    print(f"\n❌ ERROR: Your API Key is likely invalid.\nDetails: {e}")
+    print(f"\nERROR: API key may be invalid.\nDetails: {e}")

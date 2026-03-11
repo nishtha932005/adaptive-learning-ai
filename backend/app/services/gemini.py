@@ -1,34 +1,32 @@
 import os
 import json
+import asyncio
 from typing import List, Optional, Tuple, Any
 
 try:
-    import google.generativeai as genai
+    from google import genai
 except ImportError as exc:  # pragma: no cover - environment-specific
     genai = None  # type: ignore[assignment]
 
 
-def _ensure_gemini_configured() -> str:
+def _ensure_gemini_client() -> Any:
     """
-    Configure the Gemini client and return the model id.
+    Build and return the Gemini client.
 
     Raises:
         RuntimeError: if the SDK is missing or the API key is not set.
     """
     if genai is None:
         raise RuntimeError(
-            "google-generativeai is not installed in this environment. "
-            "Install it with 'pip install google-generativeai'."
+            "google-genai is not installed in this environment. "
+            "Install it with 'pip install google-genai'."
         )
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY environment variable is not set.")
 
-    genai.configure(api_key=api_key)
-
-    model_id = os.getenv("GEMINI_MODEL_ID", "gemini-2.0-flash-lite")
-    return model_id
+    return genai.Client(api_key=api_key)
 
 
 class GeminiService:
@@ -40,14 +38,26 @@ class GeminiService:
     """
 
     def __init__(self, model_id: Optional[str] = None) -> None:
-        self._model_id = model_id or os.getenv("GEMINI_MODEL_ID", "gemini-2.0-flash-lite")
+        self._model_id = model_id or os.getenv("GEMINI_MODEL_ID", "gemini-3.1-pro-preview")
+        self._client = _ensure_gemini_client()
 
-    def _get_model(self):
-        model_id = _ensure_gemini_configured()
-        # Always prefer configured id, but fall back to instance override if given.
-        if self._model_id:
-            model_id = self._model_id
-        return genai.GenerativeModel(model_id)
+    async def _generate_text(self, prompt: str) -> str:
+        try:
+            response = await asyncio.to_thread(
+                self._client.models.generate_content,
+                model=self._model_id,
+                contents=prompt,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            error_msg = str(exc)
+            if "429" in error_msg or "quota" in error_msg.lower() or "rate limit" in error_msg.lower():
+                raise RuntimeError(f"Gemini API quota exceeded. Please try again later. Details: {error_msg}")
+            raise RuntimeError(f"Gemini generate_content failed: {error_msg}") from exc
+
+        text = self._extract_response_text(response)
+        if not text:
+            raise RuntimeError("Gemini returned an empty response.")
+        return text
 
     @staticmethod
     def _extract_response_text(response: Any) -> str:
@@ -95,12 +105,7 @@ class GeminiService:
             prompt = f"Provide a concise, clear explanation of {topic} suitable for a university student."
 
         try:
-            model = self._get_model()
-            response = await model.generate_content_async(prompt)
-            text = self._extract_response_text(response)
-            if not text:
-                raise RuntimeError("Gemini returned an empty response.")
-            return text
+            return await self._generate_text(prompt)
         except RuntimeError:
             # Bubble up configuration errors as-is.
             raise
@@ -135,12 +140,7 @@ class GeminiService:
             )
 
         try:
-            model = self._get_model()
-            response = await model.generate_content_async(prompt)
-            text = getattr(response, "text", None) or ""
-            if not text:
-                raise RuntimeError("Gemini returned an empty response.")
-            return text
+            return await self._generate_text(prompt)
         except RuntimeError:
             raise
         except Exception as exc:  # pragma: no cover
@@ -170,17 +170,31 @@ class GeminiService:
         if mode == "summarize":
             if not input_text:
                 raise RuntimeError("Summarizer requires input_text.")
+
+            detail_norm = (detail or "standard").lower()
+            if detail_norm == "short":
+                style = (
+                    "Summarize the text into 3-5 very concise bullet points. "
+                    "First, infer the core keywords and then center the summary around those key ideas. "
+                    "Avoid extra commentary."
+                )
+            elif "deep" in detail_norm:
+                style = (
+                    "Provide a detailed, structured summary with sections and bullet points. "
+                    "Explicitly capture the main concepts and how they relate, based on the strongest keywords in the text."
+                )
+            else:
+                style = (
+                    "Summarize the following text into clear bullet points and key takeaways. "
+                    "Focus on clarity and structure, highlighting the most important keywords and concepts."
+                )
+
             prompt = (
-                "Summarize the following text into clear bullet points and key takeaways. "
-                "Focus on clarity and structure.\n\n"
+                f"{style}\n\n"
                 f"TEXT:\n{input_text}"
             )
             try:
-                model = self._get_model()
-                response = await model.generate_content_async(prompt)
-                text = getattr(response, "text", None) or ""
-                if not text:
-                    raise RuntimeError("Gemini returned an empty summary.")
+                text = await self._generate_text(prompt)
                 return "summarize", text, None
             except RuntimeError:
                 raise
@@ -190,9 +204,24 @@ class GeminiService:
         if mode == "quiz":
             if not topic:
                 raise RuntimeError("Quiz generator requires a topic.")
-            prompt = (
 
+            level_norm = (level or "standard").lower()
+            if level_norm == "easy":
+                difficulty_instructions = (
+                    "Make the questions beginner-friendly, focusing on basic recall and simple understanding."
+                )
+            elif level_norm == "hard":
+                difficulty_instructions = (
+                    "Make the questions challenging, focusing on deeper reasoning, edge cases, and subtle conceptual traps."
+                )
+            else:
+                difficulty_instructions = (
+                    "Use a mix of recall and conceptual understanding suitable for an average university student."
+                )
+
+            prompt = (
                 f"Generate {num_questions or 5} multiple-choice questions about the following topic. "
+                f"{difficulty_instructions} "
                 "Return ONLY raw JSON (no commentary, no markdown) in this format:\n"
                 "[\n"
                 "  {\n"
@@ -205,9 +234,7 @@ class GeminiService:
                 f"TOPIC: {topic}"
             )
             try:
-                model = self._get_model()
-                response = await model.generate_content_async(prompt)
-                raw = getattr(response, "text", None) or ""
+                raw = await self._generate_text(prompt)
                 if not raw:
                     raise RuntimeError("Gemini returned an empty quiz payload.")
 
@@ -241,11 +268,7 @@ class GeminiService:
                 f"TOPIC OR QUESTION: {topic}"
             )
             try:
-                model = self._get_model()
-                response = await model.generate_content_async(prompt)
-                text = getattr(response, "text", None) or ""
-                if not text:
-                    raise RuntimeError("Gemini returned an empty Socratic prompt.")
+                text = await self._generate_text(prompt)
                 return "socratic", text, None
             except RuntimeError:
                 raise
@@ -257,30 +280,57 @@ class GeminiService:
                 raise RuntimeError("Visualizer requires a topic.")
             # Hard cap topic length to keep prompt small and protect rate/quotas
             safe_topic = (topic or "")[:300]
-            diagram = (diagram_type or "flowchart").lower()
+            raw_diagram = (diagram_type or "flowchart").strip().lower()
 
-            if diagram == "flowchart":
-                # Highly optimized prompt: ask ONLY for mermaid code, no prose.
-                prompt = (
-                    "You are a diagram engine. Generate a simple Mermaid.js FLOWCHART for this topic.\n"
-                    "Respond with ONLY a ```mermaid code block and nothing else (no text before or after).\n\n"
-                    f"TOPIC: {safe_topic}"
-                )
+            # Map UI-friendly labels to Mermaid diagram types
+            if "mindmap" in raw_diagram:
+                mermaid_hint = "mindmap"
+                diagram_label = "MINDMAP"
+                syntax_hint = "Start with 'mindmap' and use indented bullets for branches."
+            elif "sequence" in raw_diagram:
+                mermaid_hint = "sequenceDiagram"
+                diagram_label = "SEQUENCE DIAGRAM"
+                syntax_hint = "Start with 'sequenceDiagram' and use 'participant' and message lines."
+            elif "class" in raw_diagram:
+                mermaid_hint = "classDiagram"
+                diagram_label = "CLASS DIAGRAM"
+                syntax_hint = "Start with 'classDiagram' and declare classes and relationships."
+            elif "state" in raw_diagram:
+                mermaid_hint = "stateDiagram-v2"
+                diagram_label = "STATE DIAGRAM"
+                syntax_hint = "Start with 'stateDiagram-v2' and define states and transitions."
+            elif "entity" in raw_diagram or "er" in raw_diagram:
+                mermaid_hint = "erDiagram"
+                diagram_label = "ENTITY RELATIONSHIP DIAGRAM"
+                syntax_hint = "Start with 'erDiagram' and define entities and relationships."
+            elif "journey" in raw_diagram:
+                mermaid_hint = "journey"
+                diagram_label = "USER JOURNEY"
+                syntax_hint = "Start with 'journey' and define stages and steps."
+            elif "gantt" in raw_diagram:
+                mermaid_hint = "gantt"
+                diagram_label = "GANTT CHART"
+                syntax_hint = "Start with 'gantt' and define date ranges and tasks."
+            elif "pie" in raw_diagram:
+                mermaid_hint = "pie"
+                diagram_label = "PIE CHART"
+                syntax_hint = "Start with 'pie' and list label:value pairs."
             else:
-                # Other diagram types can still include a tiny summary if the model chooses.
-                prompt = (
-                    "Generate a concise Mermaid.js diagram for the topic below.\n"
-                    f"Preferred diagram type: {diagram}.\n"
-                    "Start with a ```mermaid code block containing ONLY the diagram code. "
-                    "Optionally, you may add one short sentence of summary after the code block.\n\n"
-                    f"TOPIC: {safe_topic}"
-                )
+                mermaid_hint = "flowchart TD"
+                diagram_label = "FLOWCHART"
+                syntax_hint = "Start with 'flowchart TD' and connect steps with arrows."
+
+            # Highly optimized prompt: ask primarily for mermaid code.
+            prompt = (
+                "You are a diagram engine. Generate a Mermaid.js diagram for this topic.\n"
+                f"Requested diagram type: {diagram_label}. {syntax_hint}\n"
+                f"Use Mermaid syntax starting with: {mermaid_hint}.\n"
+                "Respond with ONLY a ```mermaid code block containing the diagram. "
+                "Optionally, after the code block, you may add one short sentence explaining the high-level idea.\n\n"
+                f"TOPIC: {safe_topic}"
+            )
             try:
-                model = self._get_model()
-                response = await model.generate_content_async(prompt)
-                text = getattr(response, "text", None) or ""
-                if not text:
-                    raise RuntimeError("Gemini returned an empty visualization payload.")
+                text = await self._generate_text(prompt)
                 return "visualize", text, None
             except RuntimeError:
                 raise
@@ -311,13 +361,44 @@ class AdaptiveTutor:
     def __init__(self, service: Optional[GeminiService] = None) -> None:
         self._service = service or GeminiService()
 
-    async def get_adaptive_explanation(self, topic: str, struggle_score: int) -> str:
+    async def get_adaptive_explanation(
+        self,
+        topic: str,
+        struggle_score: Optional[int] = None,
+        difficulty: Optional[str] = None,
+    ) -> str:
         """
-        struggle_score: 0–100. Higher means student is struggling more.
+        difficulty: explicit user level from frontend ('beginner' | 'intermediate' | 'advanced').
+        struggle_score: optional legacy 0-100 score used when difficulty is not supplied.
         """
-        if struggle_score >= 70:
+        level = (difficulty or "").strip().lower()
+
+        # Preferred path: explicit slider level from frontend.
+        if level in {"beginner", "intermediate", "advanced"}:
+            if level == "beginner":
+                prompt = (
+                    f"Explain {topic} for a beginner learner using simple language and 2 practical examples. "
+                    "Avoid jargon, and end with a quick recap in 3 bullet points."
+                )
+            elif level == "advanced":
+                prompt = (
+                    f"Give an advanced technical explanation of {topic}. "
+                    "Include underlying mechanisms, trade-offs, and deeper reasoning. "
+                    "Use precise terminology and provide one challenging applied scenario."
+                )
+            else:
+                prompt = (
+                    f"Explain {topic} at an intermediate level with conceptual clarity. "
+                    "Connect key ideas, include one practical example, and avoid over-simplification."
+                )
+
+            return await self._service.generate_content(topic=prompt, difficulty="raw")
+
+        # Backward-compatible path: infer mode from struggle score if provided.
+        score = 50 if struggle_score is None else struggle_score
+        if score >= 70:
             mode = "simplify"
-        elif struggle_score <= 30:
+        elif score <= 30:
             mode = "deep_dive"
         else:
             mode = "standard"
@@ -329,17 +410,21 @@ def list_gemini_models() -> List[str]:
     """
     Returns a list of available Gemini model ids that support generateContent.
     """
-    model_id = _ensure_gemini_configured()
-    # model_id is only used to ensure config; we still list all models
+    client = _ensure_gemini_client()
 
     try:
-        models = genai.list_models()
+        models = client.models.list()
         ids: List[str] = []
         for m in models:
-            # m.supported_generation_methods is typically like ['generateContent', ...]
-            methods = getattr(m, "supported_generation_methods", []) or []
-            if "generateContent" in methods:
-                ids.append(getattr(m, "name", ""))
+            name = getattr(m, "name", "") or ""
+            methods = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None) or []
+            if methods:
+                normalized = {str(item).lower() for item in methods}
+                if "generatecontent" in normalized or "generate_content" in normalized:
+                    ids.append(name)
+                    continue
+            if "gemini" in name.lower():
+                ids.append(name)
         return [m for m in ids if m]
     except RuntimeError:
         raise

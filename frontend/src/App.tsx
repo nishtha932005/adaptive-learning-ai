@@ -35,6 +35,7 @@ function DashboardApp() {
         <Route path="/overview" element={<Dashboard />} />
         <Route path="/study" element={<StudyRoomPage />} />
         <Route path="/courses" element={<CoursesLibrary />} />
+        <Route path="/course/:id/module/:moduleIndex" element={<CoursePlayer />} />
         <Route path="/courses/:id/module/:moduleIndex" element={<CoursePlayer />} />
         <Route path="/course/:id" element={<CoursePlayer />} />
         <Route path="/lesson/:chapterId" element={<LessonViewer />} />

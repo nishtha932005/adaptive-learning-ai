@@ -25,9 +25,26 @@ import pickle
 import joblib
 import pandas as pd
 import numpy as np
+from pathlib import Path
 
-# Load model relative to this file
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "..", "student_progress_model.pkl")
+# Resolve model path robustly for local dev and Docker/App Runner
+_HERE = Path(__file__).resolve()
+_BACKEND_DIR = _HERE.parents[2]  # .../backend
+_PROJECT_ROOT = _BACKEND_DIR.parent
+
+_MODEL_CANDIDATES = [
+    _BACKEND_DIR / "student_progress_model.pkl",
+    _PROJECT_ROOT / "student_progress_model.pkl",
+]
+
+def _find_model_path() -> str | None:
+    for candidate in _MODEL_CANDIDATES:
+        if candidate.is_file():
+            return str(candidate)
+    print(f"⚠️ No ML model file found in candidates: {[str(p) for p in _MODEL_CANDIDATES]}")
+    return None
+
+MODEL_PATH = _find_model_path()
 
 def _extract_predictor(candidate):
     """Return a usable model object that exposes .predict, else None."""
@@ -45,8 +62,9 @@ def _extract_predictor(candidate):
 
     return None
 
-
-def _load_ml_model(path: str):
+def _load_ml_model(path: str | None):
+    if not path:
+        return None
     def _pickle_loader(p: str):
         with open(p, "rb") as f:
             return pickle.load(f)
@@ -67,7 +85,6 @@ def _load_ml_model(path: str):
             print(f"⚠️ Model load attempt failed via {loader.__name__}: {e}")
 
     return None
-
 
 _ml_model = _load_ml_model(MODEL_PATH)
 

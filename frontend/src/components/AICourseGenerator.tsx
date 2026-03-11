@@ -83,7 +83,7 @@ export default function AICourseGenerator({
       const course: GeneratedCourse | undefined = data?.course;
       const hasModules = Array.isArray(course?.modules) && course!.modules.length > 0;
       const hasChapters = !!course?.modules?.some(
-        (module) => Array.isArray(module?.chapters) && module.chapters.length > 0
+        (module: any) => Array.isArray(module?.chapters) && module.chapters.length > 0
       );
 
       if (!course || !hasModules || !hasChapters) {

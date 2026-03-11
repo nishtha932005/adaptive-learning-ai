@@ -2,10 +2,27 @@ import React, { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { CheckCircle2, Play, Lock, Sword, Video, HelpCircle, Loader2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
-import { useTheme } from "../../context/ThemeContext";
-import type { SagaNode } from "../../services/sagaService";
 import { useAuth } from "../../context/AuthContext";
 import { useCourses } from "../../context/CourseContext";
+
+type SagaNode = {
+  id: string;
+  chapter_number: number;
+  title: string;
+  subtitle: string;
+  xp_reward: number;
+  estimated_time_minutes: number;
+  type: "video" | "quiz" | "boss_fight";
+  prerequisite_chapter_id: string | null;
+  course_id: string;
+  action_url: string | null;
+  action_type: "course" | "lesson";
+  action_params?: Record<string, string | number | null>;
+  status: "active" | "locked" | "completed";
+  completed_at: string | null;
+  xp_earned: number;
+  time_spent_minutes: number;
+};
 
 const ONBOARDING_GOAL_STORAGE_KEY = "onboarding_learning_goal";
 const AUTO_GENERATE_TIMEOUT_MS = 15000;
@@ -20,7 +37,6 @@ function SagaItem({
   totalNodes: number;
 }) {
   const navigate = useNavigate();
-  const { themeColor } = useTheme();
 
   const getNodeIcon = () => {
     if (node.status === "completed") {
@@ -55,7 +71,7 @@ function SagaItem({
     const courseId = node.action_params?.courseId;
     const moduleIndex = node.action_params?.moduleIndex;
     if (node.action_type === "course" && courseId !== undefined && moduleIndex !== undefined) {
-      navigate(`/dashboard/courses/${courseId}/module/${moduleIndex}`);
+      navigate(`/dashboard/course/${courseId}/module/${moduleIndex}`);
       return;
     }
 
@@ -152,7 +168,7 @@ function SagaItem({
           <div className="flex-1">
             <div className="flex items-center gap-2 mb-1">
               <span className="text-[10px] font-bold uppercase tracking-wider text-primary">
-                Chapter {node.chapter_number}
+                Module {node.chapter_number}
               </span>
               <span className="text-slate-400 dark:text-slate-500">{getTypeIcon()}</span>
             </div>
@@ -215,15 +231,49 @@ export default function SagaMap({ onOpenGenerator }: { onOpenGenerator?: () => v
   const mapCourseToNodes = (course: any): SagaNode[] => {
     if (!course?.modules?.length) return [];
 
+    const getLessonHeading = (lesson: any): string => {
+      if (typeof lesson === "string") return lesson.trim();
+      if (lesson && typeof lesson === "object") {
+        return String(lesson.title || lesson.name || lesson.content || "").trim();
+      }
+      return "";
+    };
+
     return course.modules.map((module: any, index: number) => {
-      const chapterCount = Array.isArray(module?.chapters) ? module.chapters.length : 0;
+      const directLessons = Array.isArray(module?.lessons) ? module.lessons : [];
+      const chapterTitles = Array.isArray(module?.chapters)
+        ? module.chapters.map((chapter: any) => getLessonHeading(chapter?.title || chapter)).filter(Boolean)
+        : [];
+      const legacyChapterLessons = Array.isArray(module?.chapters)
+        ? module.chapters.flatMap((chapter: any) => {
+            if (Array.isArray(chapter?.lessons) && chapter.lessons.length > 0) {
+              return chapter.lessons;
+            }
+            return chapter?.title ? [chapter.title] : [];
+          })
+        : [];
+      const lessonPool = directLessons.length > 0 ? directLessons : legacyChapterLessons;
+
+      const normalizedLessonTitles = lessonPool
+        .map((lesson: any) => getLessonHeading(lesson))
+        .filter(Boolean);
+
+      const estimatedTimeMinutes = (normalizedLessonTitles.length || chapterTitles.length) * 10;
+      const lessonHeadings = normalizedLessonTitles.map(
+        (lessonTitle: string, lessonIndex: number) => `${index + 1}.${lessonIndex + 1} ${lessonTitle}`
+      );
+
+      const subtitle = lessonHeadings.length
+        ? lessonHeadings.join(" • ")
+        : "No lessons available yet";
+
       return {
         id: `generated-${course.id || "course"}-module-${index + 1}`,
         chapter_number: index + 1,
-        title: module?.title || `Module ${index + 1}`,
-        subtitle: `${chapterCount} chapter${chapterCount === 1 ? "" : "s"}`,
+        title: String(module?.title || ""),
+        subtitle,
         xp_reward: 400 + index * 50,
-        estimated_time_minutes: Math.max(10, chapterCount * 10),
+        estimated_time_minutes: estimatedTimeMinutes,
         type: "video",
         prerequisite_chapter_id:
           index > 0 ? `generated-${course.id || "course"}-module-${index}` : null,
@@ -234,7 +284,7 @@ export default function SagaMap({ onOpenGenerator }: { onOpenGenerator?: () => v
           source: "course-context",
           courseId: course.id || "generated-course",
           moduleIndex: index,
-          moduleTitle: module?.title || `Module ${index + 1}`,
+          moduleTitle: String(module?.title || ""),
         },
         status: index === 0 ? "active" : "locked",
         completed_at: null,

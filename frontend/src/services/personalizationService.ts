@@ -36,7 +36,10 @@ export async function generatePersonalizedSaga(userId: string): Promise<void> {
       .single();
 
     // Call AI to generate personalized saga
-    const API_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+    const API_URL =
+      import.meta.env.VITE_API_URL ||
+      import.meta.env.VITE_BACKEND_URL ||
+      "http://127.0.0.1:8000";
     const response = await fetch(`${API_URL}/api/ai/personalize-saga`, {
       method: "POST",
       headers: {

@@ -10,12 +10,14 @@ import {
   CheckCircle2,
 } from "lucide-react";
 import ConfettiExplosion from "react-confetti-explosion";
-import { mapSliderToDifficulty, runStudyTool, StudyToolMode, QuizItem } from "../services/studyService";
+import { runStudyTool, StudyToolMode, QuizItem } from "../services/studyService";
 import MarkdownRenderer from "../components/MarkdownRenderer";
+import QuizRenderer from "../components/QuizRenderer";
 import { supabase } from "../lib/supabase";
 import { useAuth } from "../context/AuthContext";
 import { motion, AnimatePresence } from "framer-motion";
 import StruggleMonitor from "../components/dashboard/StruggleMonitor";
+import { useCourses } from "../context/CourseContext";
 
 type QuizState = {
   items: QuizItem[];
@@ -35,8 +37,14 @@ type ChatMessage = {
 };
 
 export default function StudyRoomPage() {
+  const API_URL =
+    (import.meta as any).env?.VITE_API_URL ||
+    (import.meta as any).env?.VITE_BACKEND_URL ||
+    "http://127.0.0.1:8000";
+
   const [searchParams, setSearchParams] = useSearchParams();
   const { user } = useAuth();
+  const { latestGeneratedCourse } = useCourses();
 
   // Initialize mode from URL params if present
   const urlMode = searchParams.get("mode") as StudyToolMode | null;
@@ -46,8 +54,13 @@ export default function StudyRoomPage() {
 
   const [mode, setMode] = useState<StudyToolMode>(urlMode || "explain");
 
+  const defaultCourseTopic =
+    latestGeneratedCourse?.title ||
+    latestGeneratedCourse?.modules?.[0]?.title ||
+    "";
+
   // Shared
-  const [topic, setTopic] = useState(urlTopic || "");
+  const [topic, setTopic] = useState(urlTopic || defaultCourseTopic || "");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [userPreferences, setUserPreferences] = useState<{
@@ -95,7 +108,7 @@ export default function StudyRoomPage() {
   const [summaryDetail, setSummaryDetail] = useState<"short" | "standard" | "deep">("standard");
 
   // Quiz - Initialize with URL topic or default
-  const [quizTopic, setQuizTopic] = useState(urlTopic || "Dynamic Programming");
+  const [quizTopic, setQuizTopic] = useState(urlTopic || defaultCourseTopic || "");
   const [quizLevel, setQuizLevel] = useState<"easy" | "standard" | "hard">("standard");
   const [quizCountSetting, setQuizCountSetting] = useState<number>(5);
   const [quizState, setQuizState] = useState<QuizState>({
@@ -111,12 +124,12 @@ export default function StudyRoomPage() {
   const [showQuizConfetti, setShowQuizConfetti] = useState(false);
 
   // Socratic - Initialize with URL topic or default
-  const [socraticTopic, setSocraticTopic] = useState(urlTopic || "Recursion");
+  const [socraticTopic, setSocraticTopic] = useState(urlTopic || defaultCourseTopic || "");
   const [chatInput, setChatInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
 
   // Visualizer - Initialize with URL topic or default
-  const [visualTopic, setVisualTopic] = useState(urlTopic || "Backpropagation in Neural Networks");
+  const [visualTopic, setVisualTopic] = useState(urlTopic || defaultCourseTopic || "");
   const [diagramType, setDiagramType] = useState("Flowchart");
   const [visualContent, setVisualContent] = useState("");
   const [quizLogged, setQuizLogged] = useState(false);
@@ -143,7 +156,7 @@ export default function StudyRoomPage() {
           return;
         }
 
-        const response = await fetch("http://127.0.0.1:8000/api/student/status", {
+        const response = await fetch(`${API_URL}/api/student/status`, {
           signal: controller.signal,
           headers: { 'Accept': 'application/json' }
         });
@@ -206,7 +219,7 @@ export default function StudyRoomPage() {
       clearTimeout(timeoutId);
       window.removeEventListener('online', handleOnline);
     };
-  }, [baselineSet]);
+  }, [baselineSet, API_URL]);
 
   // Learning Rate Calculation Effect
   useEffect(() => {
@@ -295,18 +308,21 @@ export default function StudyRoomPage() {
   };
 
   const handleExplain = async () => {
-    if (!topic.trim()) return;
+    const effectiveTopic = (topic || defaultCourseTopic || "").trim();
+    if (!effectiveTopic) return;
+    if (!topic.trim()) {
+      setTopic(effectiveTopic);
+    }
     setLoading(true);
     setError(null);
     setFullContent("");
     setDisplayContent("");
     setShowChips(false);
     try {
-      const difficulty = slider;
       const res = await runStudyTool({
         tool_type: "explain",
-        topic,
-        difficulty,
+        topic: effectiveTopic,
+        difficulty: slider,
       });
       setFullContent(res.content || "");
     } catch (err) {
@@ -366,25 +382,7 @@ export default function StudyRoomPage() {
         phase: "lobby",
       }));
     } catch (err) {
-      // Fallback
-      const fallback: QuizItem[] = [
-        {
-          question: `What best describes ${quizTopic}?`,
-          options: [
-            "A random concept unrelated to the topic",
-            "A core idea you should understand deeply",
-            "A minor detail you can safely ignore",
-            "A purely theoretical construct with no applications",
-          ],
-          correctAnswer: "A core idea you should understand deeply",
-        },
-      ];
-      setQuizState((prev) => ({
-        ...prev,
-        items: fallback,
-        phase: "lobby",
-      }));
-      setError(null);
+      setError("Failed to generate quiz. Please try again.");
     } finally {
       setLoading(false);
     }
@@ -468,10 +466,11 @@ export default function StudyRoomPage() {
   };
 
   const logQuizResult = async (score: number, total: number) => {
-    if (!user?.id || total === 0) return;
+    const cognitoId = (user as any)?.sub as string | undefined;
+    if (!cognitoId || total === 0) return;
     try {
       await supabase.from("assessment_results").insert({
-        student_id: user.id,
+        student_id: cognitoId,
         topic: quizTopic,
         score: Math.round((score / total) * 100),
         weak_areas: [],
@@ -480,7 +479,7 @@ export default function StudyRoomPage() {
       const xpEarned = Math.round((score / total) * 100);
       const timeSpentMinutes = 5;
       const { updateSagaFromActivity } = await import("../services/sagaService");
-      await updateSagaFromActivity(user.id, "quiz", xpEarned, timeSpentMinutes);
+      await updateSagaFromActivity(cognitoId, "quiz", xpEarned, timeSpentMinutes);
     } catch (e) {
       console.error("Failed to log quiz result", e);
     }
@@ -608,31 +607,20 @@ export default function StudyRoomPage() {
               <button type="button" onClick={startQuiz} className="px-6 py-3 rounded-xl bg-primary text-white font-semibold shadow-lg">Start Quiz</button>
             </div>
           )}
-          {quizState.phase === "question" && quizState.items[quizState.currentIndex] && (
-            <div className="space-y-4">
-              <div className="flex justify-between text-xs text-slate-400">
-                <span>Question {quizState.currentIndex + 1} / {quizState.items.length}</span>
-                <span>Time: {quizState.timer}s</span>
-              </div>
-              <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-700">
-                <p className="font-medium mb-3">{quizState.items[quizState.currentIndex].question}</p>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                  {quizState.items[quizState.currentIndex].options.map(opt => (
-                    <button key={opt} onClick={() => handleQuizAnswer(quizState.currentIndex, opt)} className={`text-left p-3 rounded-xl border text-xs transition-all ${quizState.selected === opt ? "border-violet-500 bg-violet-500/20" : "border-slate-700 hover:border-violet-500/50"}`}>{opt}</button>
-                  ))}
-                </div>
-                <button onClick={() => revealCurrent(false)} disabled={!quizState.selected} className="mt-4 px-4 py-2 rounded-full bg-primary text-white text-xs disabled:opacity-40">Submit</button>
-              </div>
-            </div>
-          )}
-          {quizState.phase === "reveal" && (
-            <div className="space-y-4">
-              <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-700">
-                <p className="mb-2 text-xs">Response logged. Score: {quizState.score}</p>
-                <button onClick={nextQuestion} className="px-4 py-2 rounded-full bg-primary text-white text-xs">Next</button>
-              </div>
-            </div>
-          )}
+          {(quizState.phase === "question" || quizState.phase === "reveal") &&
+            quizState.items[quizState.currentIndex] && (
+              <QuizRenderer
+                item={quizState.items[quizState.currentIndex]}
+                index={quizState.currentIndex}
+                total={quizState.items.length}
+                selected={quizState.selected}
+                phase={quizState.phase === "question" ? "question" : "reveal"}
+                timer={quizState.timer}
+                onSelect={(opt) => handleQuizAnswer(quizState.currentIndex, opt)}
+                onSubmit={() => revealCurrent(false)}
+                onNext={nextQuestion}
+              />
+            )}
           {quizState.phase === "results" && (
             <div className="flex flex-col items-center justify-center h-full gap-4">
               <p className="text-xl font-bold">Quiz Complete!</p>

@@ -16,6 +16,11 @@ import { getActiveChapter } from "../services/sagaService";
 type QuestKey = "quiz" | "watch" | "study";
 
 export default function Dashboard() {
+  const API_URL =
+    (import.meta as any).env?.VITE_API_URL ||
+    (import.meta as any).env?.VITE_BACKEND_URL ||
+    "http://127.0.0.1:8000";
+
   const { user } = useAuth();
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -31,11 +36,11 @@ export default function Dashboard() {
 
   // Fetch Python Backend Status
   useEffect(() => {
-    fetch('http://127.0.0.1:8000/api/student/status')
+    fetch(`${API_URL}/api/student/status`)
       .then(res => res.json())
       .then(data => setStudentStatus(data))
       .catch(err => console.error("Failed to fetch student status:", err));
-  }, []);
+  }, [API_URL]);
 
   useEffect(() => {
     let mounted = true;

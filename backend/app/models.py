@@ -3,7 +3,8 @@ from pydantic import BaseModel
 
 class AIExplainRequest(BaseModel):
     topic: str
-    struggle_score: int
+    struggle_score: int | None = None
+    difficulty: str | None = None  # 'beginner' | 'intermediate' | 'advanced'
 
 
 class AIExplainResponse(BaseModel):

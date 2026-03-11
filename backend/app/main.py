@@ -2,6 +2,7 @@ import os
 import json
 import re
 import asyncio
+from pathlib import Path
 from urllib.parse import quote_plus
 from fastapi import FastAPI, HTTPException
 from collections import Counter
@@ -30,7 +31,10 @@ from .services.predictor import predict_student_risk, predict_final_result
 from .services.gemini import AdaptiveTutor, GeminiService, list_gemini_models
 from .services.personalization import PersonalizationService
 
-
+# Load environment deterministically so running uvicorn from project root or
+# backend/ behaves the same.
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BACKEND_DIR / ".env")
 load_dotenv()
 
 # Simple file logger 
@@ -46,17 +50,29 @@ app = FastAPI(title="AI-Powered Adaptive Learning System")
 
 COURSE_GENERATION_TIMEOUT_SECONDS = int(os.getenv("COURSE_GENERATION_TIMEOUT_SECONDS", "20"))
 
-# CORS configuration - expanded for dev troubleshooting
-origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:3000",
-    "http://0.0.0.0:5173",
-]
+def _parse_cors_origins() -> list[str]:
+    """
+    Build allowlist from CORS_ORIGINS (comma-separated) with local defaults.
+    Example: CORS_ORIGINS=https://main.app.amplifyapp.com,https://app.example.com
+    """
+    default_origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://0.0.0.0:5173",
+    ]
+
+    raw = os.getenv("CORS_ORIGINS", "")
+    if not raw.strip():
+        return default_origins
+
+    parsed = [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
+    return parsed or default_origins
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -80,6 +96,13 @@ async def root():
     Simple handshake route so the frontend can confirm the backend is online.
     """
     return {"status": "online"}
+
+
+if __name__ == "__main__":  # pragma: no cover - container entrypoint helper
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port)
 
 
 @app.get("/api/health")
@@ -193,7 +216,9 @@ async def explain_topic(payload: AIExplainRequest):
     """
     try:
         explanation = await tutor.get_adaptive_explanation(
-            topic=payload.topic, struggle_score=payload.struggle_score
+            topic=payload.topic,
+            struggle_score=payload.struggle_score,
+            difficulty=payload.difficulty,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -313,16 +338,25 @@ Return ONLY a valid JSON object (no markdown, no explanation) with this exact st
 
   "modules": [
     {{
-            "title": "Module Name",
+            "title": "Specific module title for this topic progression",
             "chapters": [
-        {{
-                    "title": "Chapter Name",
-                    "lessons": ["lesson1", "lesson2"]
-        }}
-      ]
+                {{
+                    "title": "Chapter title",
+                    "videoId": "optional_youtube_video_id"
+                }}
+                        ]
     }}
   ]
 }}
+
+Rules:
+- Use modules[].chapters[] under each module.
+- Number chapters by module order: 1.1, 1.2, 1.3 ... then 2.1, 2.2, 2.3.
+- Chapter titles should include that numbering (example: "Chapter 1.1: Installing PyCharm").
+- Module titles must be meaningful and progress logically from beginner to advanced for the topic.
+- Avoid generic module titles like "Foundations", "Advanced Topic", "Module 1".
+- Chapter titles must be specific, practical, and unique across the whole course.
+- Chapter titles should resemble real tutorial/video topics learners would recognize.
 
 Make it practical, engaging, and tailored to {pace} pace learning!"""
 
@@ -383,22 +417,42 @@ Make it practical, engaging, and tailored to {pace} pace learning!"""
 def _create_fallback_course(topic: str, pace: str) -> dict:
     """Fallback course structure if AI generation fails"""
     module_count = {"blitz": 3, "moderate": 5, "deep": 8}.get(pace, 5)
-    
+
+    progression_labels = [
+        "Basics",
+        "Core Concepts",
+        "Hands-on Workflows",
+        "Real-world Use Cases",
+        "Deployment and Scaling",
+        "Optimization",
+        "Security and Reliability",
+        "Advanced Patterns",
+    ]
+
     modules = []
     for i in range(1, module_count + 1):
-        chapter_title = f"Chapter {i}.1: Foundations"
+        label = progression_labels[min(i - 1, len(progression_labels) - 1)]
+        module_title = f"Module {i}: {topic} {label}"
+
         modules.append({
-            "title": f"Module {i}: {topic} Fundamentals" if i == 1 else f"Module {i}: Advanced {topic}",
+            "title": module_title,
             "description": f"Learn the key concepts of {topic}",
             "chapters": [
                 {
-                    "title": chapter_title,
-                    "lessons": [
-                        f"Lesson {i}.1: Introduction to {topic}",
-                        f"Lesson {i}.2: Core concepts in {topic}",
-                        f"Lesson {i}.3: Practice and application"
-                    ]
-                }
+                    "chapterNumber": f"{i}.1",
+                    "title": f"Chapter {i}.1: {topic} essentials for {label.lower()}",
+                    "videoId": None,
+                },
+                {
+                    "chapterNumber": f"{i}.2",
+                    "title": f"Chapter {i}.2: Practical {topic} workflow in {label.lower()}",
+                    "videoId": None,
+                },
+                {
+                    "chapterNumber": f"{i}.3",
+                    "title": f"Chapter {i}.3: Common mistakes and best practices in {topic}",
+                    "videoId": None,
+                },
             ]
         })
     
@@ -425,30 +479,128 @@ def _strip_markdown_json_fences(text: str) -> str:
 
 
 
-def _to_lesson_titles(raw_lessons: object, chapter_title: str, topic: str) -> list[str]:
-    if not isinstance(raw_lessons, list):
-        return [f"Introduction to {topic}"]
+def _is_placeholder_title(value: str) -> bool:
+    lowered = (value or "").strip().lower()
+    if not lowered:
+        return True
+    return bool(
+        re.match(r"^(module\s*\d+|chapter\s*\d+(\.\d+)?|lesson\s*\d+(\.\d+)?|advanced topic|foundations?)$", lowered)
+    )
 
-    lesson_titles: list[str] = []
-    for idx, lesson in enumerate(raw_lessons, start=1):
-        if isinstance(lesson, str) and lesson.strip():
-            lesson_titles.append(lesson.strip())
-            continue
 
-        if isinstance(lesson, dict):
-            title = str(lesson.get("title") or lesson.get("name") or "").strip()
-            if title:
-                lesson_titles.append(title)
-                continue
+def _normalize_module_title(raw_title: object, topic: str, module_index: int) -> str:
+    title = str(raw_title or "").strip()
+    if not title or _is_placeholder_title(title):
+        fallback_progression = [
+            "Basics",
+            "Core Concepts",
+            "Hands-on Practice",
+            "Real-world Applications",
+            "Deployment and Scaling",
+            "Optimization",
+            "Advanced Techniques",
+        ]
+        stage = fallback_progression[min(module_index - 1, len(fallback_progression) - 1)]
+        return f"{topic} {stage}"
+    return title
 
-            content = str(lesson.get("content") or "").strip()
-            if content:
-                lesson_titles.append(f"{chapter_title} - Lesson {idx}")
-                continue
 
-        lesson_titles.append(f"{chapter_title} - Lesson {idx}")
+def _to_unique_chapter_titles(raw_chapters: object, module_title: str, topic: str) -> list[str]:
+    def _clean_title(raw: str) -> str:
+        cleaned = (raw or "").strip()
+        cleaned = re.sub(r"^(chapter\s*\d+(?:\.\d+)?\s*[:\-]\s*|lesson\s*\d+(?:\.\d+)?\s*[:\-]\s*)", "", cleaned, flags=re.IGNORECASE)
+        return cleaned.strip()
 
-    return lesson_titles or [f"Introduction to {topic}"]
+    chapters = raw_chapters if isinstance(raw_chapters, list) else []
+    if not chapters:
+        return [f"Introduction to {module_title}"]
+
+    unique_titles: list[str] = []
+    seen: set[str] = set()
+
+    for idx, lesson in enumerate(chapters, start=1):
+        title = ""
+        if isinstance(lesson, str):
+            title = _clean_title(lesson)
+        elif isinstance(lesson, dict):
+            title = str(
+                lesson.get("title")
+                or lesson.get("name")
+                or lesson.get("chapter_title")
+                or lesson.get("video_title")
+                or lesson.get("youtube_title")
+                or lesson.get("core_topic")
+                or lesson.get("content")
+                or ""
+            )
+            title = _clean_title(title)
+
+        if not title or _is_placeholder_title(title):
+            title = f"{module_title} - Key Topic {idx}"
+
+        candidate = title
+        suffix = 2
+        while candidate.lower() in seen:
+            candidate = f"{title} ({suffix})"
+            suffix += 1
+
+        seen.add(candidate.lower())
+        unique_titles.append(candidate)
+
+    return unique_titles or [f"Introduction to {topic}"]
+
+
+def _ensure_unique_across_course(chapter_titles: list[str], seen_titles: set[str]) -> list[str]:
+    unique_across_course: list[str] = []
+    for title in chapter_titles:
+        candidate = title
+        suffix = 2
+        while candidate.lower() in seen_titles:
+            candidate = f"{title} ({suffix})"
+            suffix += 1
+        seen_titles.add(candidate.lower())
+        unique_across_course.append(candidate)
+    return unique_across_course
+
+
+def _extract_module_chapters(module: dict, module_title: str, topic: str, module_index: int) -> list[dict]:
+    chapters_raw = module.get("chapters")
+    chapter_items: list[object] = []
+
+    if isinstance(chapters_raw, list) and chapters_raw:
+        chapter_items = chapters_raw
+    else:
+        # Backward compatibility for prior modules[].lessons[] outputs.
+        legacy_lessons = module.get("lessons")
+        if isinstance(legacy_lessons, list) and legacy_lessons:
+            chapter_items = legacy_lessons
+
+    if not chapter_items:
+        chapter_items = [f"Introduction to {module_title}"]
+
+    chapter_titles = _to_unique_chapter_titles(chapter_items, module_title, topic)
+    normalized_chapters: list[dict] = []
+
+    for chapter_index, chapter_title in enumerate(chapter_titles, start=1):
+        chapter_number = f"{module_index}.{chapter_index}"
+        final_title = chapter_title
+        if not re.match(r"^chapter\s*\d+\.\d+\s*[:\-]", final_title, re.IGNORECASE):
+            final_title = f"Chapter {chapter_number}: {final_title}"
+
+        source_obj = chapter_items[chapter_index - 1] if chapter_index - 1 < len(chapter_items) else None
+        video_id = None
+        if isinstance(source_obj, dict):
+            video_id = source_obj.get("videoId") or source_obj.get("video_id")
+
+        normalized_chapters.append(
+            {
+                "chapterNumber": chapter_number,
+                "title": final_title,
+                "videoId": video_id,
+            }
+        )
+
+    return normalized_chapters
 
 
 def _normalize_course_payload(candidate: dict, topic: str, pace: str) -> dict:
@@ -463,48 +615,33 @@ def _normalize_course_payload(candidate: dict, topic: str, pace: str) -> dict:
         return _create_fallback_course(topic, pace)
 
     normalized_modules: list[dict] = []
+    seen_module_titles: set[str] = set()
+    seen_chapter_titles: set[str] = set()
     for m_idx, module in enumerate(raw_modules, start=1):
         if not isinstance(module, dict):
             module = {}
 
-        module_title = str(module.get("title") or f"Module {m_idx}: {topic}").strip()
+        module_title = _normalize_module_title(module.get("title"), topic, m_idx)
+        if module_title.lower() in seen_module_titles:
+            module_title = f"{module_title} ({m_idx})"
+        seen_module_titles.add(module_title.lower())
+
+        if not re.match(r"^module\s*\d+\s*:", module_title, re.IGNORECASE):
+            module_title = f"Module {m_idx}: {module_title}"
+
         module_desc = str(module.get("description") or f"Key concepts for {module_title}").strip()
 
-        chapters_raw = module.get("chapters")
-        if not isinstance(chapters_raw, list) or not chapters_raw:
-            # Backward compatibility: old model output used module.lessons.
-            legacy_lessons = module.get("lessons")
-            chapters_raw = [
-                {
-                    "title": f"Chapter {m_idx}.1: Core Ideas",
-                    "lessons": legacy_lessons if isinstance(legacy_lessons, list) else [f"Introduction to {module_title}"],
-                }
-            ]
-
-        normalized_chapters: list[dict] = []
-        for c_idx, chapter in enumerate(chapters_raw, start=1):
-            if isinstance(chapter, str):
-                chapter = {"title": chapter, "lessons": [f"Introduction to {chapter}"]}
-            elif not isinstance(chapter, dict):
-                chapter = {}
-
-            chapter_title = str(chapter.get("title") or f"Chapter {m_idx}.{c_idx}").strip()
-            chapter_lessons = _to_lesson_titles(chapter.get("lessons"), chapter_title, topic)
-            normalized_chapters.append(
-                {
-                    "title": chapter_title,
-                    "lessons": chapter_lessons,
-                }
-            )
-
-        if not normalized_chapters:
-            normalized_chapters = [{"title": f"Chapter {m_idx}.1", "lessons": [f"Introduction to {module_title}"]}]
+        module_chapters = _extract_module_chapters(module, module_title, topic, m_idx)
+        chapter_titles = [c["title"] for c in module_chapters]
+        unique_titles = _ensure_unique_across_course(chapter_titles, seen_chapter_titles)
+        for idx, unique_title in enumerate(unique_titles):
+            module_chapters[idx]["title"] = unique_title
 
         normalized_modules.append(
             {
                 "title": module_title,
                 "description": module_desc,
-                "chapters": normalized_chapters,
+                "chapters": module_chapters,
             }
         )
 

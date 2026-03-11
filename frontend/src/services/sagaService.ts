@@ -9,8 +9,12 @@ type GeneratedCourse = {
     title?: string;
     chapters?: Array<{
       title?: string;
+      chapterNumber?: string;
+      videoId?: string;
+      video_id?: string;
       lessons?: Array<string | { title?: string; content?: string }>;
     }>;
+    lessons?: Array<string | { title?: string; content?: string; video_title?: string; youtube_title?: string; core_topic?: string }>;
   }>;
 };
 
@@ -60,24 +64,39 @@ function getGeneratedSagaNodes(studentId: string): SagaNode[] {
 
     const flatChapters = latest.modules.flatMap((module, moduleIndex) => {
       const moduleTitle = String(module?.title || `Module ${moduleIndex + 1}`);
-      const chapters = Array.isArray(module?.chapters) ? module.chapters : [];
 
-      return chapters.map((chapter, chapterIndex) => {
-        const chapterTitle = String(chapter?.title || `Chapter ${chapterIndex + 1}`);
-        const lessons = Array.isArray(chapter?.lessons) ? chapter.lessons : [];
-        const lessonCount = Math.max(1, lessons.length);
-        const chapterNumber = moduleIndex * 10 + chapterIndex + 1;
+      const chapterItems = Array.isArray(module?.chapters) ? module.chapters : [];
+      const lessonsFromChapters = chapterItems.map((chapter, chapterIndex) => {
+        const chapterNumber = String(chapter?.chapterNumber || `${moduleIndex + 1}.${chapterIndex + 1}`);
+        const rawTitle = String(chapter?.title || "").trim();
+        return rawTitle || `Chapter ${chapterNumber}: ${moduleTitle}`;
+      });
 
-        return {
-          id: `generated-${latest.id || "course"}-m${moduleIndex + 1}-c${chapterIndex + 1}`,
-          chapter_number: chapterNumber,
-          title: chapterTitle,
-          subtitle: `${moduleTitle} - ${lessonCount} lesson${lessonCount === 1 ? "" : "s"}`,
+      const directLessons = Array.isArray(module?.lessons)
+        ? module.lessons.map((lesson, lessonIndex) => {
+            const title =
+              typeof lesson === "string"
+                ? lesson
+                : String(lesson?.title || lesson?.video_title || lesson?.youtube_title || lesson?.core_topic || lesson?.content || `Lesson ${lessonIndex + 1}`);
+            return title.trim();
+          }).filter(Boolean)
+        : [];
+
+      const lessons = lessonsFromChapters.length > 0 ? lessonsFromChapters : directLessons;
+
+      const lessonCount = Math.max(1, lessons.length);
+
+      return [
+        {
+          id: `generated-${latest.id || "course"}-m${moduleIndex + 1}`,
+          chapter_number: moduleIndex + 1,
+          title: moduleTitle,
+          subtitle: lessons.join(" • "),
           xp_reward: lessonCount * 25,
-          estimated_time_minutes: lessonCount * 12,
+          estimated_time_minutes: lessonCount * 10,
           type: "video" as const,
-          prerequisite_chapter_id: chapterNumber > 1
-            ? `generated-${latest.id || "course"}-m${moduleIndex + 1}-c${chapterIndex}`
+          prerequisite_chapter_id: moduleIndex > 0
+            ? `generated-${latest.id || "course"}-m${moduleIndex}`
             : null,
           course_id: String(latest.id || "generated-course"),
           action_url: null,
@@ -86,14 +105,14 @@ function getGeneratedSagaNodes(studentId: string): SagaNode[] {
             source: "generated-course",
             studentId,
             module: moduleTitle,
-            chapter: chapterTitle,
+            lessons,
           },
           status: "locked" as const,
           completed_at: null,
           xp_earned: 0,
           time_spent_minutes: 0,
-        };
-      });
+        },
+      ];
     });
 
     return flatChapters.map((node, index) => ({
